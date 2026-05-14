@@ -1,0 +1,14 @@
+name = "study-companion-proxy"
+main = "src/worker.js"
+compatibility_date = "2025-01-01"
+
+# 部署後 endpoint 會是 https://study-companion-proxy.<你的子域>.workers.dev
+# 自訂網域請看 README
+
+[vars]
+# 非機密的變數放這裡；上線時把 ALLOWED_ORIGIN 改成你的前端網址
+ALLOWED_ORIGIN = "*"
+
+# 機密請用 wrangler secret put 指令，不要寫在這裡
+# wrangler secret put ANTHROPIC_API_KEY
+# wrangler secret put APP_TOKEN
