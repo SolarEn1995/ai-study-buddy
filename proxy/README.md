@@ -1,6 +1,6 @@
 # Study Companion Proxy
 
-Cloudflare Workers 代理，保護 Claude API Key 不暴露在前端。
+Cloudflare Workers 代理，保護 Claude / Gemini API Key 不暴露在前端。
 
 ## 部署步驟
 
@@ -11,9 +11,10 @@ npm install
 # 2. 登入 Cloudflare（會開瀏覽器授權）
 npx wrangler login
 
-# 3. 設定機密 Key（會逐一詢問值）
-npx wrangler secret put ANTHROPIC_API_KEY
-npx wrangler secret put APP_TOKEN          # 可選，建議設一個隨機字串
+# 3. 設定機密 Key（至少設定一家，兩家都設前端就能切換）
+npx wrangler secret put ANTHROPIC_API_KEY    # Claude key（可選）
+npx wrangler secret put GEMINI_API_KEY       # Gemini key（可選）
+npx wrangler secret put APP_TOKEN            # 可選，建議設一個隨機字串
 
 # 4. 編輯 wrangler.toml，把 ALLOWED_ORIGIN 改成你的前端網址
 #    本機開發階段可保持 "*"
