@@ -1,0 +1,47 @@
+{
+  "name": "學習戰友 Study Companion",
+  "short_name": "學習戰友",
+  "description": "拍照 → AI 分析 → 搞懂它。陪你走完任何學習旅程的智慧夥伴。",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#FAFAF8",
+  "theme_color": "#1a1a1a",
+  "lang": "zh-TW",
+  "categories": ["education", "productivity"],
+  "icons": [
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "今日複習",
+      "short_name": "複習",
+      "description": "查看今天到期的卡片",
+      "url": "./?view=review",
+      "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "卡關大全",
+      "short_name": "卡關",
+      "url": "./?view=stuck"
+    }
+  ]
+}
