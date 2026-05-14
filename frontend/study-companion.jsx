@@ -5,13 +5,38 @@ import { useState, useRef, useEffect, useCallback } from "react";
 const PROXY_URL = import.meta.env?.VITE_PROXY_URL || "https://study-companion-proxy.<your-subdomain>.workers.dev";
 const APP_TOKEN = import.meta.env?.VITE_APP_TOKEN || "";
 
-async function callClaude(payload) {
+// ===== AI Providers =====
+const AI_PROVIDERS = {
+  claude: {
+    label: "Claude",
+    model: "claude-sonnet-4-20250514",
+    icon: "🧠",
+    color: "#C77B3F",
+    desc: "Anthropic · 視覺最強",
+  },
+  gemini: {
+    label: "Gemini",
+    model: "gemini-1.5-flash",
+    icon: "✨",
+    color: "#1971C2",
+    desc: "Google · 免費額度大",
+  },
+};
+const PROVIDER_KEY = "study-companion-provider";
+const getProvider = () => {
+  if (typeof window === "undefined") return "claude";
+  return localStorage.getItem(PROVIDER_KEY) || "claude";
+};
+
+async function callAI(payload, provider) {
+  const useProvider = provider || getProvider();
   const headers = { "Content-Type": "application/json" };
   if (APP_TOKEN) headers["X-App-Token"] = APP_TOKEN;
+  const model = payload.model || AI_PROVIDERS[useProvider].model;
   const response = await fetch(PROXY_URL, {
     method: "POST",
     headers,
-    body: JSON.stringify(payload),
+    body: JSON.stringify({ ...payload, model, provider: useProvider }),
   });
   if (!response.ok) {
     let detail = "";
@@ -219,6 +244,13 @@ export default function StudyCompanion() {
   const [isDragging, setIsDragging] = useState(false);
   const [editingSubject, setEditingSubject] = useState(null); // null | "new" | key
   const [subjectForm, setSubjectForm] = useState({ label: "", icon: "📘", color: SUBJECT_COLORS[0] });
+  const [provider, setProvider] = useState(getProvider());
+
+  useEffect(() => {
+    if (typeof window !== "undefined") localStorage.setItem(PROVIDER_KEY, provider);
+  }, [provider]);
+
+  const aiCall = useCallback((payload) => callAI(payload, provider), [provider]);
 
   // 自動持久化
   useEffect(() => {
@@ -335,8 +367,7 @@ export default function StudyCompanion() {
 
     try {
       const subjectLabel = SUBJECTS[subject].label;
-      const data = await callClaude({
-        model: "claude-sonnet-4-20250514",
+      const data = await aiCall({
         max_tokens: 1000,
         messages: [{
           role: "user",
@@ -376,8 +407,7 @@ export default function StudyCompanion() {
 
     try {
       const subjectLabel = SUBJECTS[subject]?.label || "一般";
-      const data = await callClaude({
-        model: "claude-sonnet-4-20250514",
+      const data = await aiCall({
         max_tokens: 1000,
         messages: [{
           role: "user",
@@ -461,6 +491,23 @@ ${aiResult || "（無）"}
           <h1 style={{ fontSize: 26, fontWeight: 700, marginTop: 10 }}>學習戰友</h1>
           <p style={{ fontSize: 14, color: "#888", marginTop: 2 }}>拍照 → AI 分析 → 搞懂它</p>
         </div>
+
+        {/* AI 引擎切換 */}
+        <div style={{ display: "flex", gap: 6, padding: 4, background: "#fff", borderRadius: 10, border: "1px solid #eee" }}>
+          {Object.entries(AI_PROVIDERS).map(([key, val]) => {
+            const active = provider === key;
+            return (
+              <button key={key} onClick={() => setProvider(key)}
+                style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "8px 6px", border: "none", borderRadius: 7, cursor: "pointer", fontFamily: "inherit", fontSize: 13, fontWeight: active ? 600 : 400, background: active ? val.color : "transparent", color: active ? "#fff" : "#666", transition: "all 0.15s" }}>
+                <span style={{ fontSize: 14 }}>{val.icon}</span>
+                <span>{val.label}</span>
+              </button>
+            );
+          })}
+        </div>
+        <p style={{ fontSize: 11, color: "#aaa", marginTop: 4, textAlign: "center" }}>
+          {AI_PROVIDERS[provider]?.desc}
+        </p>
 
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 20, marginBottom: 8 }}>
           <span style={{ fontSize: 13, fontWeight: 600, color: "#555" }}>科目（{Object.keys(SUBJECTS).length}）</span>
