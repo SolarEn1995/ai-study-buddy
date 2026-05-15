@@ -241,6 +241,21 @@ const RenderWithMath = ({ text }) => (
   </>
 );
 
+// #1 \u8907\u7fd2\u9801\u9375\u76e4\u5feb\u6377\u9375\uff1a\u7528 window CustomEvent \u9023\u63a5\u5916\u90e8\u76e3\u807d\u5668\u8207\u5167\u90e8 handler
+const KeyboardBridge = ({ onGrade, onSkip }) => {
+  useEffect(() => {
+    const gradeHandler = (e) => onGrade(e.detail);
+    const skipHandler = () => onSkip();
+    window.addEventListener("review-grade", gradeHandler);
+    window.addEventListener("review-skip", skipHandler);
+    return () => {
+      window.removeEventListener("review-grade", gradeHandler);
+      window.removeEventListener("review-skip", skipHandler);
+    };
+  }, [onGrade, onSkip]);
+  return null;
+};
+
 const formatDueLabel = (card) => {
   if (!card.nextReviewAt) return "未排程";
   const diff = card.nextReviewAt - Date.now();
@@ -283,6 +298,11 @@ export default function StudyCompanion() {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [historySearch, setHistorySearch] = useState("");
   const [savedToStuck, setSavedToStuck] = useState(false);
+  // #5 \u7be9\u9078
+  const [historyFilter, setHistoryFilter] = useState("all"); // all | week | lowconf
+  const [stuckFilter, setStuckFilter] = useState("unresolved"); // unresolved | due | resolved | all
+  // #3 \u8907\u7fd2\u672c\u6b21\u6210\u679c\u7d71\u8a08
+  const [reviewSession, setReviewSession] = useState({ active: false, total: 0, correct: 0, fuzzy: 0, wrong: 0, finishedAt: null });
 
   useEffect(() => {
     if (typeof window !== "undefined") localStorage.setItem(PROVIDER_KEY, provider);
@@ -520,6 +540,37 @@ export default function StudyCompanion() {
     window.addEventListener("paste", handler);
     return () => window.removeEventListener("paste", handler);
   }, [view, processFile]);
+
+  // #1 \u8907\u7fd2\u9801\u9375\u76e4\u5feb\u6377\u9375 + #3 \u9032\u5165 review \u6642\u521d\u59cb\u5316 session
+  useEffect(() => {
+    if (view !== "review") return;
+    // \u521d\u59cb\u5316\u9019\u6b21 session\uff08\u53ea\u5728\u5c1a\u672a active \u6642\uff09
+    setReviewSession(s => s.active ? s : { active: true, total: 0, correct: 0, fuzzy: 0, wrong: 0, finishedAt: null });
+    const onKey = (e) => {
+      // \u907f\u514d\u8f38\u5165\u6846\u88e1\u8aa4\u89f8
+      const tag = e.target?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || e.target?.isContentEditable) return;
+      const k = e.key.toLowerCase();
+      if (k === " " || k === "enter") {
+        e.preventDefault();
+        setShowAnswer(v => !v);
+      } else if (k === "1") {
+        e.preventDefault();
+        window.dispatchEvent(new CustomEvent("review-grade", { detail: 0 }));
+      } else if (k === "2") {
+        e.preventDefault();
+        window.dispatchEvent(new CustomEvent("review-grade", { detail: 3 }));
+      } else if (k === "3") {
+        e.preventDefault();
+        window.dispatchEvent(new CustomEvent("review-grade", { detail: 5 }));
+      } else if (k === "s") {
+        e.preventDefault();
+        window.dispatchEvent(new CustomEvent("review-skip"));
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [view]);
 
   const handleDrop = useCallback((e) => {
     e.preventDefault();
@@ -1415,13 +1466,44 @@ ${aiResult || "（無）"}
     );
   }
 
-  if (view === "stuck") return (
+  if (view === "stuck") {
+    const filteredStuck = stuckPoints.filter(pt => {
+      if (stuckFilter === "unresolved") return !pt.resolved;
+      if (stuckFilter === "due") return !pt.resolved && isDue(pt);
+      if (stuckFilter === "resolved") return pt.resolved;
+      return true; // all
+    });
+    const deleteStuck = (id) => {
+      if (!window.confirm("\u78ba\u5b9a\u8981\u522a\u9664\u9019\u500b\u5361\u95dc\u9ede\u55ce\uff1f\u9023\u540c\u8907\u7fd2\u6392\u7a0b\u4e00\u8d77\u522a\u9664\uff0c\u7121\u6cd5\u5fa9\u539f\u3002")) return;
+      setStuckPoints(prev => prev.filter(p => p.id !== id));
+    };
+    return (
     <div style={{ fontFamily: "'Noto Sans TC', sans-serif", maxWidth: 480, margin: "0 auto", minHeight: "100vh", background: "#FAFAF8" }}>
       <style>{`@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@300;400;500;700&display=swap');*{box-sizing:border-box;margin:0;padding:0}@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}`}</style>
       <P>
         <Back />
         <h2 style={{ fontSize: 20, fontWeight: 700, marginTop: 12 }}>🚧 卡關大全</h2>
-        <p style={{ fontSize: 13, color: "#888", marginTop: 2, marginBottom: 16 }}>所有「不懂」集中在這裡</p>
+        <p style={{ fontSize: 13, color: "#888", marginTop: 2, marginBottom: 12 }}>所有「不懂」集中在這裡</p>
+
+        {/* #5 \u7be9\u9078 chip */}
+        {stuckPoints.length > 0 && (
+          <div style={{ display: "flex", gap: 6, marginBottom: 14, flexWrap: "wrap" }}>
+            {[
+              { key: "unresolved", label: "\u672a\u89e3", count: stuckPoints.filter(p => !p.resolved).length },
+              { key: "due", label: "\u4eca\u65e5\u5230\u671f", count: stuckPoints.filter(p => !p.resolved && isDue(p)).length },
+              { key: "resolved", label: "\u5df2\u641e\u61c2", count: stuckPoints.filter(p => p.resolved).length },
+              { key: "all", label: "\u5168\u90e8", count: stuckPoints.length },
+            ].map(c => {
+              const active = stuckFilter === c.key;
+              return (
+                <button key={c.key} onClick={() => setStuckFilter(c.key)}
+                  style={{ padding: "5px 12px", borderRadius: 999, border: active ? "1px solid #1a1a1a" : "1px solid #e0e3e8", background: active ? "#1a1a1a" : "#fff", color: active ? "#fff" : "#666", fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>
+                  {c.label} <span style={{ opacity: 0.6, marginLeft: 2 }}>{c.count}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
 
         {stuckPoints.length === 0 ? (
           <div style={{ textAlign: "center", padding: "44px 20px", color: "#777" }}>
@@ -1429,7 +1511,12 @@ ${aiResult || "（無）"}
             <p style={{ marginTop: 10, fontWeight: 500 }}>還沒有卡關紀錄</p>
             <p style={{ fontSize: 13, color: "#999", marginTop: 4 }}>分析筆記後對不懂的地方提問，就會記錄在這</p>
           </div>
-        ) : stuckPoints.map((pt) => {
+        ) : filteredStuck.length === 0 ? (
+          <div style={{ textAlign: "center", padding: "30px 20px", color: "#777" }}>
+            <span style={{ fontSize: 36 }}>\ud83d\udd0d</span>
+            <p style={{ marginTop: 8, fontSize: 13 }}>\u9019\u500b\u7be9\u9078\u4e0b\u6c92\u6709\u7d50\u679c</p>
+          </div>
+        ) : filteredStuck.map((pt) => {
           const subj = SUBJECTS[pt.subject];
           const outlineGroups = parseOutline(subj?.outline);
           const units = outlineGroups.flatMap(g => g.children);
@@ -1472,25 +1559,40 @@ ${aiResult || "（無）"}
             {pt.reviewTopic && <p style={{ fontSize: 12, color: "#1971C2", marginTop: 4 }}>📚 {pt.reviewTopic}</p>}
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 8 }}>
               <span style={{ fontSize: 11, color: "#bbb" }}>{pt.timestamp} · {pt.resolved ? "已搞懂" : formatDueLabel(pt)}</span>
-              <button onClick={() => setStuckPoints(prev => prev.map(p => p.id === pt.id ? { ...p, resolved: !p.resolved } : p))}
-                style={{ padding: "4px 10px", border: "1px solid #ddd", borderRadius: 5, cursor: "pointer", background: "#fff", fontSize: 11, fontFamily: "inherit" }}>
-                {pt.resolved ? "↩ 再看看" : "✓ 搞懂了"}
-              </button>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button onClick={() => setStuckPoints(prev => prev.map(p => p.id === pt.id ? { ...p, resolved: !p.resolved } : p))}
+                  style={{ padding: "4px 10px", border: "1px solid #ddd", borderRadius: 5, cursor: "pointer", background: "#fff", fontSize: 11, fontFamily: "inherit" }}>
+                  {pt.resolved ? "↩ 再看看" : "✓ 搞懂了"}
+                </button>
+                {/* #6 \u522a\u9664 */}
+                <button onClick={() => deleteStuck(pt.id)} title="\u522a\u9664"
+                  style={{ padding: "4px 8px", border: "1px solid #ffe0e0", borderRadius: 5, cursor: "pointer", background: "#fff5f5", color: "#C62828", fontSize: 11, fontFamily: "inherit" }}>
+                  \ud83d\uddd1
+                </button>
+              </div>
             </div>
           </div>
         );})}
       </P>
     </div>
   );
+  }
 
   if (view === "history") {
     // 依日期降序 + 搜尋過濾，依科目分組
     const q = historySearch.trim().toLowerCase();
+    const oneWeekAgo = Date.now() - 7 * DAY_MS;
     const filteredNotes = [...notes]
       .filter(n => {
-        if (!q) return true;
-        const haystack = `${n.title || ""} ${n.unit || ""} ${n.content || ""} ${SUBJECTS[n.subject]?.label || ""}`.toLowerCase();
-        return haystack.includes(q);
+        // \u6587\u5b57\u641c\u5c0b
+        if (q) {
+          const haystack = `${n.title || ""} ${n.unit || ""} ${n.content || ""} ${SUBJECTS[n.subject]?.label || ""}`.toLowerCase();
+          if (!haystack.includes(q)) return false;
+        }
+        // chip \u7be9\u9078
+        if (historyFilter === "week") return (n.id || 0) > oneWeekAgo;
+        if (historyFilter === "lowconf") return /\u5efa\u8b70\u81ea\u884c\u8a08\u7b97|\u9700\u9a57\u8b49/.test(n.content || "");
+        return true;
       })
       .sort((a, b) => (b.id || 0) - (a.id || 0));
     const grouped = filteredNotes.reduce((acc, n) => {
@@ -1498,6 +1600,13 @@ ${aiResult || "（無）"}
       (acc[key] = acc[key] || []).push(n);
       return acc;
     }, {});
+
+    // #6 \u522a\u9664\u55ae\u7b46\u6b77\u53f2
+    const deleteNote = (id) => {
+      if (!window.confirm("\u78ba\u5b9a\u8981\u522a\u9664\u9019\u7b46\u7b46\u8a18\u55ce\uff1f\u9019\u500b\u52d5\u4f5c\u7121\u6cd5\u5fa9\u539f\u3002")) return;
+      setNotes(prev => prev.filter(n => n.id !== id));
+      if (selectedNote?.id === id) setSelectedNote(null);
+    };
 
     return (
       <div style={{ fontFamily: "'Noto Sans TC', sans-serif", maxWidth: 480, margin: "0 auto", minHeight: "100vh", background: "#FAFAF8" }}>
@@ -1524,6 +1633,25 @@ ${aiResult || "（無）"}
             </div>
           )}
 
+          {/* #5 \u7be9\u9078 chip */}
+          {!selectedNote && notes.length > 0 && (
+            <div style={{ display: "flex", gap: 6, marginBottom: 14, flexWrap: "wrap" }}>
+              {[
+                { key: "all", label: "\u5168\u90e8", count: notes.length },
+                { key: "week", label: "\u672c\u9031", count: notes.filter(n => (n.id || 0) > oneWeekAgo).length },
+                { key: "lowconf", label: "\u9700\u9a57\u8b49", count: notes.filter(n => /\u5efa\u8b70\u81ea\u884c\u8a08\u7b97|\u9700\u9a57\u8b49/.test(n.content || "")).length },
+              ].map(c => {
+                const active = historyFilter === c.key;
+                return (
+                  <button key={c.key} onClick={() => setHistoryFilter(c.key)}
+                    style={{ padding: "5px 12px", borderRadius: 999, border: active ? "1px solid #1a1a1a" : "1px solid #e0e3e8", background: active ? "#1a1a1a" : "#fff", color: active ? "#fff" : "#666", fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>
+                    {c.label} <span style={{ opacity: 0.6, marginLeft: 2 }}>{c.count}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
           {selectedNote ? (
             <div>
               <button onClick={() => setSelectedNote(null)}
@@ -1544,6 +1672,11 @@ ${aiResult || "（無）"}
                       )}
                     </div>
                   </div>
+                  {/* #6 \u522a\u9664 */}
+                  <button onClick={() => deleteNote(selectedNote.id)} title="\u522a\u9664\u9019\u7b46\u7d00\u9304"
+                    style={{ background: "#fff5f5", border: "1px solid #ffe0e0", color: "#C62828", padding: "5px 10px", borderRadius: 6, fontSize: 12, cursor: "pointer", fontFamily: "inherit" }}>
+                    \ud83d\uddd1 \u522a\u9664
+                  </button>
                 </div>
                 {renderAIContent(selectedNote.content || "")}
               </div>
@@ -1574,18 +1707,28 @@ ${aiResult || "（無）"}
                   const subjColor = SUBJECTS[sKey]?.color || "#999";
                   const preview = (n.content || "").replace(/^#+\s*/gm, "").replace(/\*\*/g, "").slice(0, 60);
                   return (
-                    <button key={n.id} onClick={() => setSelectedNote(n)}
-                      style={{ width: "100%", textAlign: "left", background: "#fff", padding: "12px 14px", borderRadius: 10, border: "1px solid #eef0f4", marginBottom: 8, cursor: "pointer", fontFamily: "inherit", display: "block", boxShadow: "0 2px 6px rgba(0,0,0,0.02)" }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4, gap: 6 }}>
-                        <span style={{ fontSize: 11, color: "#999" }}>{n.timestamp}</span>
-                        {n.unit && <span style={{ fontSize: 10, padding: "2px 7px", borderRadius: 4, background: `${subjColor}15`, color: subjColor, fontWeight: 500 }}>📍 {n.unit}</span>}
-                      </div>
-                      {n.title ? (
-                        <p style={{ fontSize: 14, fontWeight: 600, color: "#1a1a1a", lineHeight: 1.4, margin: 0 }}>{n.title}</p>
-                      ) : (
-                        <p style={{ fontSize: 13, color: "#444", lineHeight: 1.5, margin: 0 }}>{preview}{preview.length >= 60 ? "..." : ""}</p>
-                      )}
-                    </button>
+                    <div key={n.id} style={{ position: "relative", marginBottom: 8 }}>
+                      <button onClick={() => setSelectedNote(n)}
+                        style={{ width: "100%", textAlign: "left", background: "#fff", padding: "12px 38px 12px 14px", borderRadius: 10, border: "1px solid #eef0f4", cursor: "pointer", fontFamily: "inherit", display: "block", boxShadow: "0 2px 6px rgba(0,0,0,0.02)" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4, gap: 6 }}>
+                          <span style={{ fontSize: 11, color: "#999" }}>{n.timestamp}</span>
+                          {n.unit && <span style={{ fontSize: 10, padding: "2px 7px", borderRadius: 4, background: `${subjColor}15`, color: subjColor, fontWeight: 500 }}>\ud83d\udccd {n.unit}</span>}
+                        </div>
+                        {n.title ? (
+                          <p style={{ fontSize: 14, fontWeight: 600, color: "#1a1a1a", lineHeight: 1.4, margin: 0 }}>{n.title}</p>
+                        ) : (
+                          <p style={{ fontSize: 13, color: "#444", lineHeight: 1.5, margin: 0 }}>{preview}{preview.length >= 60 ? "..." : ""}</p>
+                        )}
+                      </button>
+                      {/* #6 \u522a\u9664\u6309\u9215 */}
+                      <button onClick={(e) => { e.stopPropagation(); deleteNote(n.id); }}
+                        title="\u522a\u9664"
+                        style={{ position: "absolute", top: 8, right: 8, width: 24, height: 24, border: "none", borderRadius: 6, background: "transparent", color: "#bbb", fontSize: 14, cursor: "pointer", fontFamily: "inherit", display: "flex", alignItems: "center", justifyContent: "center" }}
+                        onMouseEnter={(e) => { e.currentTarget.style.background = "#fff5f5"; e.currentTarget.style.color = "#C62828"; }}
+                        onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "#bbb"; }}>
+                        \u00d7
+                      </button>
+                    </div>
                   );
                 })}
               </div>
@@ -1600,33 +1743,156 @@ ${aiResult || "（無）"}
     const unresolved = stuckPoints
       .filter(p => !p.resolved && isDue(p))
       .sort((a, b) => (a.nextReviewAt ?? 0) - (b.nextReviewAt ?? 0));
-    if (unresolved.length === 0) return (
-      <div style={{ fontFamily: "'Noto Sans TC', sans-serif", maxWidth: 480, margin: "0 auto", minHeight: "100vh", background: "#FAFAF8" }}>
-        <P><Back /><div style={{ textAlign: "center", padding: "44px 20px" }}><span style={{ fontSize: 44 }}>🎉</span><p style={{ marginTop: 10 }}>今日複習完成！</p><p style={{ fontSize: 13, color: "#888", marginTop: 6 }}>下一張卡片會在排程時間到達後出現</p></div></P>
-      </div>
-    );
+
+    // #3 \u5168\u90e8\u8907\u7fd2\u5b8c\u6210 \u2192 \u6176\u795d\u756b\u9762
+    if (unresolved.length === 0) {
+      const { total, correct, fuzzy, wrong } = reviewSession;
+      // 7 \u65e5\u71b1\u529b\u5716\uff1a\u4ee5 lastReviewedAt \u7d71\u8a08
+      const today = new Date(); today.setHours(0,0,0,0);
+      const days = Array.from({ length: 7 }, (_, i) => {
+        const d = new Date(today); d.setDate(today.getDate() - (6 - i));
+        return d.getTime();
+      });
+      const dayCounts = days.map(start => {
+        const end = start + DAY_MS;
+        return stuckPoints.filter(p => p.lastReviewedAt && p.lastReviewedAt >= start && p.lastReviewedAt < end).length;
+      });
+      const maxCount = Math.max(1, ...dayCounts);
+      const totalSolved = stuckPoints.filter(p => p.resolved).length;
+      const accuracy = total > 0 ? Math.round((correct / total) * 100) : 0;
+
+      // \u9032\u5165\u6176\u795d\u756b\u9762\u5f8c\u91cd\u7f6e session\uff08\u4e0b\u6b21\u9032\u5165 review \u624d\u91cd\u65b0\u8a08\uff09
+      // \u4f7f\u7528 setTimeout \u907f\u514d render \u4e2d\u8a2d\u5b58
+      if (reviewSession.active && reviewSession.finishedAt == null) {
+        setTimeout(() => setReviewSession(s => ({ ...s, finishedAt: Date.now() })), 0);
+      }
+
+      return (
+        <div style={{ fontFamily: "'Noto Sans TC', sans-serif", maxWidth: 480, margin: "0 auto", minHeight: "100vh", background: "linear-gradient(180deg,#FFF8E1 0%,#FAFAF8 240px)" }}>
+          <style>{`@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@300;400;500;700;900&display=swap');*{box-sizing:border-box;margin:0;padding:0}@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}@keyframes pop{0%{transform:scale(0.5);opacity:0}60%{transform:scale(1.1)}100%{transform:scale(1);opacity:1}}@keyframes shine{0%,100%{transform:rotate(0deg)}50%{transform:rotate(8deg)}}`}</style>
+          <P>
+            <Back />
+            <div style={{ textAlign: "center", padding: "20px 8px 0" }}>
+              <div style={{ fontSize: 72, animation: "pop 0.5s ease-out", display: "inline-block" }}>
+                <span style={{ display: "inline-block", animation: "shine 1.6s ease-in-out infinite" }}>\ud83c\udf89</span>
+              </div>
+              <h2 style={{ fontSize: 22, fontWeight: 900, marginTop: 10, color: "#1a1a1a" }}>
+                {total > 0 ? "\u672c\u56de\u5408\u5b8c\u6210\uff01" : "\u4eca\u65e5\u8907\u7fd2\u5b8c\u6210\uff01"}
+              </h2>
+              <p style={{ fontSize: 13, color: "#888", marginTop: 6 }}>
+                {total > 0 ? "\u4f60\u662f\u73a9\u771f\u7684\u3002\u660e\u5929\u898b\uff5e\ud83d\udc4b" : "\u4e0b\u4e00\u5f35\u5361\u7247\u6703\u5728\u6392\u7a0b\u6642\u9593\u5230\u9054\u5f8c\u51fa\u73fe"}
+              </p>
+            </div>
+
+            {/* \u672c\u56de\u5408\u7d71\u8a08\uff08\u53ea\u5728\u6709\u8a55\u5206\u904e\u624d\u986f\u793a\uff09 */}
+            {total > 0 && (
+              <div style={{ marginTop: 22, background: "#fff", padding: "16px 14px", borderRadius: 14, boxShadow: "0 4px 16px rgba(0,0,0,0.05)" }}>
+                <div style={{ fontSize: 12, color: "#888", textAlign: "center", marginBottom: 10 }}>\u9019\u4e00\u56de\u5408</div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 4, textAlign: "center" }}>
+                  <div>
+                    <div style={{ fontSize: 22, fontWeight: 900, color: "#1971C2" }}>{total}</div>
+                    <div style={{ fontSize: 10, color: "#999", marginTop: 2 }}>\u5f9e\u8907\u7fd2</div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 22, fontWeight: 900, color: "#2B8A3E" }}>{correct}</div>
+                    <div style={{ fontSize: 10, color: "#999", marginTop: 2 }}>\u2705 \u61c2\u4e86</div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 22, fontWeight: 900, color: "#E8590C" }}>{fuzzy}</div>
+                    <div style={{ fontSize: 10, color: "#999", marginTop: 2 }}>\ud83e\udd14 \u6a21\u7cca</div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 22, fontWeight: 900, color: "#C62828" }}>{wrong}</div>
+                    <div style={{ fontSize: 10, color: "#999", marginTop: 2 }}>\ud83d\ude35 \u4e0d\u61c2</div>
+                  </div>
+                </div>
+                <div style={{ marginTop: 12, paddingTop: 10, borderTop: "1px solid #f0f0f0", textAlign: "center" }}>
+                  <span style={{ fontSize: 12, color: "#666" }}>\u638c\u63e1\u5ea6 </span>
+                  <span style={{ fontSize: 18, fontWeight: 900, color: accuracy >= 70 ? "#2B8A3E" : accuracy >= 40 ? "#E8590C" : "#C62828" }}>{accuracy}%</span>
+                </div>
+              </div>
+            )}
+
+            {/* 7 \u65e5\u71b1\u529b\u5716 */}
+            <div style={{ marginTop: 18, background: "#fff", padding: "14px", borderRadius: 14, boxShadow: "0 4px 16px rgba(0,0,0,0.05)" }}>
+              <div style={{ fontSize: 12, color: "#888", marginBottom: 10 }}>\u8fd1 7 \u65e5\u8907\u7fd2\u8db3\u8de1</div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 6 }}>
+                {days.map((d, i) => {
+                  const c = dayCounts[i];
+                  const intensity = c / maxCount;
+                  const bg = c === 0 ? "#f0f0f0" : `rgba(43,138,62,${0.25 + intensity * 0.75})`;
+                  const dateStr = new Date(d).getDate();
+                  const isToday = i === 6;
+                  return (
+                    <div key={d} style={{ textAlign: "center" }}>
+                      <div style={{ height: 32, borderRadius: 6, background: bg, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, color: c > 0 ? "#fff" : "#bbb", border: isToday ? "2px solid #1a1a1a" : "none" }}>
+                        {c || ""}
+                      </div>
+                      <div style={{ fontSize: 9, color: "#aaa", marginTop: 3 }}>{dateStr}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* \u7e3d\u9ad4\u7a4d\u7d2f */}
+            <div style={{ marginTop: 18, background: "#fff", padding: "12px 14px", borderRadius: 12, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div>
+                <div style={{ fontSize: 11, color: "#888" }}>\u7d2f\u7a4d\u514b\u670d\u5361\u95dc</div>
+                <div style={{ fontSize: 20, fontWeight: 900, color: "#2B8A3E", marginTop: 2 }}>{totalSolved} <span style={{ fontSize: 12, color: "#999", fontWeight: 400 }}>/ {stuckPoints.length}</span></div>
+              </div>
+              <span style={{ fontSize: 32 }}>\ud83d\udcaa</span>
+            </div>
+
+            <button onClick={() => { setReviewSession({ active: false, total: 0, correct: 0, fuzzy: 0, wrong: 0, finishedAt: null }); setView("home"); }}
+              style={{ width: "100%", marginTop: 18, padding: "13px", border: "none", borderRadius: 10, cursor: "pointer", background: "#1a1a1a", color: "#fff", fontSize: 14, fontWeight: 600, fontFamily: "inherit" }}>
+              \u56de\u9996\u9801
+            </button>
+          </P>
+        </div>
+      );
+    }
+
     const card = unresolved[currentCard % unresolved.length];
 
     const handleGrade = (quality) => {
       setStuckPoints(prev => prev.map(p => p.id === card.id ? gradeCard(p, quality) : p));
+      setReviewSession(s => ({
+        ...s,
+        active: true,
+        total: s.total + 1,
+        correct: quality === 5 ? s.correct + 1 : s.correct,
+        fuzzy: quality === 3 ? s.fuzzy + 1 : s.fuzzy,
+        wrong: quality < 3 ? s.wrong + 1 : s.wrong,
+      }));
       setShowAnswer(false);
       setCurrentCard(c => c + 1);
     };
+    const handleSkip = () => { setShowAnswer(false); setCurrentCard(c => c + 1); };
 
     return (
       <div style={{ fontFamily: "'Noto Sans TC', sans-serif", maxWidth: 480, margin: "0 auto", minHeight: "100vh", background: "#FAFAF8" }}>
         <style>{`@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@300;400;500;700&display=swap');*{box-sizing:border-box;margin:0;padding:0}@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}`}</style>
+        {/* #1 \u9023\u52d5\u9375\u76e4\u5feb\u6377\u9375 */}
+        <KeyboardBridge onGrade={handleGrade} onSkip={handleSkip} />
         <P>
           <Back />
           <h2 style={{ fontSize: 20, fontWeight: 700, marginTop: 12, textAlign: "center" }}>🔄 間隔複習</h2>
-          <p style={{ textAlign: "center", fontSize: 13, color: "#888", marginBottom: 20 }}>{currentCard % unresolved.length + 1} / {unresolved.length}</p>
+          <p style={{ textAlign: "center", fontSize: 13, color: "#888", marginBottom: 10 }}>
+            {currentCard % unresolved.length + 1} / {unresolved.length}
+            {reviewSession.total > 0 && <span style={{ marginLeft: 8, color: "#bbb" }}>· 已答 {reviewSession.total}</span>}
+          </p>
+          {/* \u9032\u5ea6\u689d */}
+          <div style={{ height: 4, background: "#eee", borderRadius: 2, marginBottom: 16, overflow: "hidden" }}>
+            <div style={{ height: "100%", width: `${Math.min(100, ((currentCard % unresolved.length) / unresolved.length) * 100)}%`, background: "linear-gradient(90deg,#1971C2,#5F3DC4)", transition: "width 0.3s ease" }} />
+          </div>
 
           <div onClick={() => setShowAnswer(!showAnswer)}
             style={{ background: "#fff", padding: "28px 20px", borderRadius: 12, border: "1px solid #e8e8e8", borderTop: `4px solid ${SUBJECTS[card.subject]?.color}`, minHeight: 180, cursor: "pointer", textAlign: "center", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
             <span style={{ fontSize: 12, fontWeight: 600, color: "#999" }}>{SUBJECTS[card.subject]?.label}</span>
             <p style={{ fontSize: 16, fontWeight: 500, marginTop: 12, lineHeight: 1.6 }}>{card.question || card.summary}</p>
             {!showAnswer ? (
-              <p style={{ marginTop: 20, fontSize: 13, color: "#ccc" }}>👆 點擊看解答</p>
+              <p style={{ marginTop: 20, fontSize: 13, color: "#ccc" }}>\ud83d\udc46 \u9ede\u64ca\u770b\u89e3\u7b54 <span style={{ fontSize: 10, opacity: 0.7, marginLeft: 4 }}>(Space)</span></p>
             ) : (
               <div onClick={(e) => e.stopPropagation()}
                 style={{ marginTop: 16, paddingTop: 14, borderTop: "1px solid #eee", textAlign: "left", width: "100%", maxHeight: "60vh", overflowY: "auto" }}>
@@ -1644,17 +1910,22 @@ ${aiResult || "（無）"}
           </div>
 
           <div style={{ display: "flex", gap: 8, marginTop: 18 }}>
-            <button onClick={() => handleGrade(0)} style={{ flex: 1, padding: "13px 6px", border: "none", borderRadius: 8, cursor: "pointer", color: "#fff", fontSize: 13, fontWeight: 600, fontFamily: "inherit", background: "#C62828" }}>😵 不懂<div style={{ fontSize: 10, opacity: 0.8, marginTop: 2 }}>10 分鐘後</div></button>
-            <button onClick={() => handleGrade(3)} style={{ flex: 1, padding: "13px 6px", border: "none", borderRadius: 8, cursor: "pointer", color: "#fff", fontSize: 13, fontWeight: 600, fontFamily: "inherit", background: "#E8590C" }}>🤔 模糊<div style={{ fontSize: 10, opacity: 0.8, marginTop: 2 }}>明天</div></button>
-            <button onClick={() => handleGrade(5)} style={{ flex: 1, padding: "13px 6px", border: "none", borderRadius: 8, cursor: "pointer", color: "#fff", fontSize: 13, fontWeight: 600, fontFamily: "inherit", background: "#2B8A3E" }}>✅ 懂了<div style={{ fontSize: 10, opacity: 0.8, marginTop: 2 }}>拉長間隔</div></button>
+            <button onClick={() => handleGrade(0)} title="\u5feb\u6377\u9375 1" style={{ flex: 1, padding: "13px 6px", border: "none", borderRadius: 8, cursor: "pointer", color: "#fff", fontSize: 13, fontWeight: 600, fontFamily: "inherit", background: "#C62828" }}>\ud83d\ude35 \u4e0d\u61c2<div style={{ fontSize: 10, opacity: 0.8, marginTop: 2 }}>10 \u5206\u9418\u5f8c \u00b7 1</div></button>
+            <button onClick={() => handleGrade(3)} title="\u5feb\u6377\u9375 2" style={{ flex: 1, padding: "13px 6px", border: "none", borderRadius: 8, cursor: "pointer", color: "#fff", fontSize: 13, fontWeight: 600, fontFamily: "inherit", background: "#E8590C" }}>\ud83e\udd14 \u6a21\u7cca<div style={{ fontSize: 10, opacity: 0.8, marginTop: 2 }}>\u660e\u5929 \u00b7 2</div></button>
+            <button onClick={() => handleGrade(5)} title="\u5feb\u6377\u9375 3" style={{ flex: 1, padding: "13px 6px", border: "none", borderRadius: 8, cursor: "pointer", color: "#fff", fontSize: 13, fontWeight: 600, fontFamily: "inherit", background: "#2B8A3E" }}>\u2705 \u61c2\u4e86<div style={{ fontSize: 10, opacity: 0.8, marginTop: 2 }}>\u62c9\u9577\u9593\u9694 \u00b7 3</div></button>
           </div>
 
-          {/* #9 跳過（不寫入 SRS） */}
-          <button onClick={() => { setShowAnswer(false); setCurrentCard(c => c + 1); }}
-            title="只看下一張不評分，不影響複習排程"
+          {/* #9 \u8df3\u904e\uff08\u4e0d\u5beb\u5165 SRS\uff09 */}
+          <button onClick={handleSkip}
+            title="\u5feb\u6377\u9375 S\uff1a\u770b\u4e0b\u4e00\u5f35\u4e0d\u8a55\u5206\uff0c\u4e0d\u5f71\u97ff\u8907\u7fd2\u6392\u7a0b"
             style={{ width: "100%", marginTop: 8, padding: "10px", border: "1px solid #ddd", borderRadius: 8, background: "#fff", color: "#888", fontSize: 12, fontWeight: 500, cursor: "pointer", fontFamily: "inherit" }}>
-            ⏭ 看下一張（不評分）
+            \u23ed \u770b\u4e0b\u4e00\u5f35\uff08\u4e0d\u8a55\u5206 \u00b7 S\uff09
           </button>
+
+          {/* \u684c\u9762\u63d0\u793a */}
+          <p style={{ fontSize: 10, color: "#bbb", textAlign: "center", marginTop: 14 }}>
+            \ud83d\udcbb \u684c\u9762\u5feb\u6377\u9375\uff1aSpace \u7ffb\u9762 \u00b7 1/2/3 \u8a55\u5206 \u00b7 S \u8df3\u904e
+          </p>
         </P>
       </div>
     );
