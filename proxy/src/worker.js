@@ -109,16 +109,21 @@ async function callGemini(body, env) {
   if (!env.GEMINI_API_KEY) {
     return { status: 500, data: { error: "GEMINI_API_KEY not configured" } };
   }
-  const safeMaxTokens = Math.min(Number(max_tokens) || 1024, 2048);
-  const geminiModel = model.startsWith("gemini-") ? model : "gemini-1.5-flash";
+  const safeMaxTokens = Math.min(Number(max_tokens) || 2048, 8192);
+  const geminiModel = model.startsWith("gemini-") ? model : "gemini-2.5-flash";
 
   const url = `${GEMINI_URL}/${geminiModel}:generateContent?key=${env.GEMINI_API_KEY}`;
+  // Gemini 2.5 系列預設開啟 thinking，會吃掉大量 output token。設為 0 關閉。
+  const generationConfig = { maxOutputTokens: safeMaxTokens, temperature: 0.7 };
+  if (geminiModel.startsWith("gemini-2.5")) {
+    generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  }
   const resp = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       contents: anthropicToGeminiContents(messages),
-      generationConfig: { maxOutputTokens: safeMaxTokens, temperature: 0.7 },
+      generationConfig,
     }),
   });
   const raw = await resp.json().catch(() => ({}));
@@ -136,6 +141,7 @@ async function callGemini(body, env) {
       provider: "gemini",
       model: geminiModel,
       usage: raw.usageMetadata,
+      finishReason: raw.candidates?.[0]?.finishReason,
     },
   };
 }
