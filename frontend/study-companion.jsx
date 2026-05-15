@@ -16,7 +16,7 @@ const AI_PROVIDERS = {
   },
   gemini: {
     label: "Gemini",
-    model: "gemini-1.5-flash",
+    model: "gemini-2.5-flash",
     icon: "✨",
     color: "#1971C2",
     desc: "Google · 免費額度大",
@@ -24,8 +24,8 @@ const AI_PROVIDERS = {
 };
 const PROVIDER_KEY = "study-companion-provider";
 const getProvider = () => {
-  if (typeof window === "undefined") return "claude";
-  return localStorage.getItem(PROVIDER_KEY) || "claude";
+  if (typeof window === "undefined") return "gemini";
+  return localStorage.getItem(PROVIDER_KEY) || "gemini";
 };
 
 async function callAI(payload, provider) {
@@ -47,10 +47,10 @@ async function callAI(payload, provider) {
 }
 
 const DEFAULT_SUBJECTS = {
-  math: { label: "數學", icon: "∑", color: "#E8590C" },
-  electronics: { label: "電子學", icon: "⚡", color: "#2B8A3E" },
-  electrical: { label: "電學", icon: "🔌", color: "#1971C2" },
-  digital: { label: "數位邏輯", icon: "⬡", color: "#9C36B5" },
+  math: { label: "數學", icon: "∑", color: "#E8590C", outline: "" },
+  electronics: { label: "電子學", icon: "⚡", color: "#2B8A3E", outline: "" },
+  electrical: { label: "電學", icon: "🔌", color: "#1971C2", outline: "" },
+  digital: { label: "數位邏輯", icon: "⦡", color: "#9C36B5", outline: "" },
 };
 
 // 候選顏色（新增科目時輪流選用）
@@ -74,10 +74,12 @@ const loadState = () => {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return { stuckPoints: [], notes: [], subjects: DEFAULT_SUBJECTS };
     const parsed = JSON.parse(raw);
+    // 只在「從未存過 subjects」時回退到預設；存過空物件代表使用者刻意清空，應尊重
+    const hasSubjectsField = parsed && Object.prototype.hasOwnProperty.call(parsed, "subjects");
     return {
       stuckPoints: Array.isArray(parsed.stuckPoints) ? parsed.stuckPoints : [],
       notes: Array.isArray(parsed.notes) ? parsed.notes : [],
-      subjects: parsed.subjects && typeof parsed.subjects === "object" && Object.keys(parsed.subjects).length > 0
+      subjects: hasSubjectsField && parsed.subjects && typeof parsed.subjects === "object"
         ? parsed.subjects
         : DEFAULT_SUBJECTS,
     };
@@ -89,8 +91,13 @@ const loadState = () => {
 const saveState = (stuckPoints, notes, subjects) => {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ stuckPoints, notes, subjects }));
+    return { ok: true };
   } catch (e) {
     console.warn("無法寫入 localStorage：", e);
+    const isQuota = e && (e.name === "QuotaExceededError"
+      || e.code === 22 || e.code === 1014
+      || /quota|storage/i.test(e.message || ""));
+    return { ok: false, quota: isQuota, error: e };
   }
 };
 
@@ -132,6 +139,31 @@ const gradeCard = (card, quality) => {
 };
 
 const isDue = (card) => (card.nextReviewAt ?? 0) <= Date.now();
+
+// ===== 大綱階層解析 =====
+// 偵測「主章節 / 單元」開頭：第N單元、第N章、Ch.N、Chapter N、Part N、單元N、Unit N、X.Y 之上層 X
+const isOutlineParent = (line) => {
+  const s = line.trim();
+  return /^(第\s*[\d一二三四五六七八九十百千]+\s*[單章篇部])/.test(s)
+      || /^(單元|Unit|Part|Chapter|Ch)\b/i.test(s)
+      || /^Ch\.?\s*\d+/i.test(s)
+      || /^[【\[].*?[】\]]\s*\S/.test(s);
+};
+const parseOutline = (outline) => {
+  const lines = (outline || "").split("\n").map(s => s.trim()).filter(Boolean);
+  const groups = [];
+  let current = null;
+  for (const ln of lines) {
+    if (isOutlineParent(ln)) {
+      current = { parent: ln, children: [] };
+      groups.push(current);
+    } else {
+      if (!current) { current = { parent: null, children: [] }; groups.push(current); }
+      current.children.push(ln);
+    }
+  }
+  return groups;
+};
 
 // ===== KaTeX 動態載入 =====
 let katexLoadPromise = null;
@@ -243,8 +275,14 @@ export default function StudyCompanion() {
   const [showAnswer, setShowAnswer] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [editingSubject, setEditingSubject] = useState(null); // null | "new" | key
-  const [subjectForm, setSubjectForm] = useState({ label: "", icon: "📘", color: SUBJECT_COLORS[0] });
+  const [subjectForm, setSubjectForm] = useState({ label: "", icon: "📘", color: SUBJECT_COLORS[0], outline: "" });
   const [provider, setProvider] = useState(getProvider());
+  const [selectedNote, setSelectedNote] = useState(null);
+  const [outlineExtracting, setOutlineExtracting] = useState(false);
+  const [showAllSubjects, setShowAllSubjects] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [historySearch, setHistorySearch] = useState("");
+  const [savedToStuck, setSavedToStuck] = useState(false);
 
   useEffect(() => {
     if (typeof window !== "undefined") localStorage.setItem(PROVIDER_KEY, provider);
@@ -252,9 +290,28 @@ export default function StudyCompanion() {
 
   const aiCall = useCallback((payload) => callAI(payload, provider), [provider]);
 
+  // 儲存警示狀態（#10）
+  const [storageWarn, setStorageWarn] = useState(null); // null | "quota" | "error"
+  // 首頁 onboarding 提示是否關閉（#7）
+  const [hintDismissed, setHintDismissed] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return localStorage.getItem("study-companion-hint-dismissed") === "1";
+  });
+  const dismissHint = () => {
+    setHintDismissed(true);
+    try { localStorage.setItem("study-companion-hint-dismissed", "1"); } catch {}
+  };
+  // 大綱辨識進度（#16）
+  const [outlineProgress, setOutlineProgress] = useState({ current: 0, total: 0 });
+
   // 自動持久化
   useEffect(() => {
-    saveState(stuckPoints, notes, subjects);
+    const result = saveState(stuckPoints, notes, subjects);
+    if (!result.ok) {
+      setStorageWarn(result.quota ? "quota" : "error");
+    } else if (storageWarn) {
+      setStorageWarn(null);
+    }
   }, [stuckPoints, notes, subjects]);
 
   // 別名：保留原本 SUBJECTS 名稱以最小化變動
@@ -266,9 +323,10 @@ export default function StudyCompanion() {
         label: "",
         icon: "📘",
         color: SUBJECT_COLORS[Object.keys(subjects).length % SUBJECT_COLORS.length],
+        outline: "",
       });
     } else {
-      setSubjectForm({ ...subjects[key] });
+      setSubjectForm({ outline: "", ...subjects[key] });
     }
     setEditingSubject(key);
   };
@@ -303,11 +361,132 @@ export default function StudyCompanion() {
     setEditingSubject(null);
   };
 
+  const extractOutlineFromImages = useCallback(async (files) => {
+    if (!files || files.length === 0) return;
+    setOutlineExtracting(true);
+    setOutlineProgress({ current: 0, total: files.length });
+    try {
+      // 讀取所有圖檔為 base64（不計入進度，只是讀檔）
+      const images = await Promise.all(Array.from(files).map(file => new Promise((resolve, reject) => {
+        if (!file.type.startsWith("image/")) return resolve(null);
+        const reader = new FileReader();
+        reader.onload = (ev) => resolve(ev.target.result.split(",")[1]);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      })));
+      const validImages = images.filter(Boolean);
+      if (validImages.length === 0) return;
+      setOutlineProgress({ current: 0, total: validImages.length });
+
+      const content = [
+        ...validImages.map(data => ({ type: "image", source: { type: "base64", media_type: "image/jpeg", data } })),
+        { type: "text", text: `這${validImages.length > 1 ? `${validImages.length} 張` : "張"}圖片是課程大綱/章節目錄。請辨識出所有章節標題，整理成乾淨清單。
+
+要求：
+1. 只輸出章節標題，**每行一個**，不要任何前後綴說明
+2. 保留原始章節編號（如 Ch.1、第一章、Chapter 1、1.1 等）
+3. 同一章節的子小節可省略，只保留主章節；除非整份大綱只有小節
+4. 不要加任何 markdown 符號（不要 #、*、- 開頭）
+5. 順序依照圖片中由上到下、由左到右
+
+直接輸出清單，不要任何說明文字。` },
+      ];
+
+      const data = await aiCall({
+        max_tokens: 2048,
+        messages: [{ role: "user", content }],
+      });
+      const text = (data.content?.map(c => c.text || "").join("\n") || "").trim();
+      // 清理：移除 markdown 符號、空行
+      const cleaned = text
+        .split("\n")
+        .map(l => l.trim().replace(/^[-*#>\d.]+\s*/, m => /^\d/.test(m) ? m : "").replace(/^[-*>]\s+/, "").trim())
+        .filter(Boolean)
+        .join("\n");
+      setSubjectForm(prev => ({
+        ...prev,
+        outline: prev.outline ? `${prev.outline.trim()}\n${cleaned}` : cleaned,
+      }));
+    } catch (err) {
+      alert("辨識失敗：" + err.message);
+    } finally {
+      setOutlineExtracting(false);
+      setOutlineProgress({ current: 0, total: 0 });
+    }
+  }, [aiCall]);
+
   const addStuckPoint = (point) => {
     setStuckPoints((prev) => [{
       id: Date.now(), ...point, subject, timestamp: new Date().toLocaleDateString("zh-TW"), resolved: false,
       ...initSRS(),
     }, ...prev]);
+  };
+
+  const exportData = () => {
+    const payload = {
+      app: "study-companion",
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      stuckPoints,
+      notes,
+      subjects,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const date = new Date().toISOString().slice(0, 10);
+    a.href = url;
+    a.download = `study-companion-backup-${date}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const importData = (file, mode = "merge") => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const data = JSON.parse(ev.target.result);
+        if (data.app !== "study-companion") throw new Error("不是有效的備份檔");
+        const importedStuck = Array.isArray(data.stuckPoints) ? data.stuckPoints : [];
+        const importedNotes = Array.isArray(data.notes) ? data.notes : [];
+        const importedSubjects = (data.subjects && typeof data.subjects === "object") ? data.subjects : {};
+
+        if (mode === "replace") {
+          setStuckPoints(importedStuck);
+          setNotes(importedNotes);
+          setSubjects(Object.keys(importedSubjects).length > 0 ? importedSubjects : DEFAULT_SUBJECTS);
+          alert(`✓ 已還原備份\n卡關 ${importedStuck.length}・歷史 ${importedNotes.length}・科目 ${Object.keys(importedSubjects).length}`);
+        } else {
+          // merge: 以 id 去重
+          setStuckPoints(prev => {
+            const ids = new Set(prev.map(p => p.id));
+            return [...prev, ...importedStuck.filter(p => !ids.has(p.id))];
+          });
+          setNotes(prev => {
+            const ids = new Set(prev.map(n => n.id));
+            return [...prev, ...importedNotes.filter(n => !ids.has(n.id))];
+          });
+          // 科目合併：本機若仍是預設值（未被使用者改動）→ 用備份蓋掉；否則保留本機
+          setSubjects(prev => {
+            const next = { ...prev };
+            for (const [k, v] of Object.entries(importedSubjects)) {
+              const isUntouchedDefault = DEFAULT_SUBJECTS[k]
+                && next[k]
+                && JSON.stringify(next[k]) === JSON.stringify(DEFAULT_SUBJECTS[k]);
+              if (!next[k] || isUntouchedDefault) next[k] = v;
+            }
+            return next;
+          });
+          alert(`✓ 已合併備份\n新增卡關 ${importedStuck.length}・新增歷史 ${importedNotes.length}`);
+        }
+      } catch (err) {
+        alert("匯入失敗：" + err.message);
+      }
+    };
+    reader.readAsText(file);
   };
 
   const addNote = (note) => {
@@ -350,10 +529,19 @@ export default function StudyCompanion() {
     if (files && files.length > 0) processFile(files[0]);
   }, [processFile]);
 
+  const handleFilePick = useCallback((e) => {
+    const file = e.target.files?.[0];
+    if (file) processFile(file);
+    e.target.value = ""; // 允許再次選同一檔
+  }, [processFile]);
+
   const analyzeImage = async (useDemo = false) => {
     if (!useDemo && !imageData) return;
     setLoading(true);
     setAiResult(null);
+    setFollowUp(null);
+    setQuestionInput("");
+    setSavedToStuck(false);
 
     if (useDemo) {
       await new Promise((r) => setTimeout(r, 1500));
@@ -367,14 +555,23 @@ export default function StudyCompanion() {
 
     try {
       const subjectLabel = SUBJECTS[subject].label;
+      const outline = (SUBJECTS[subject]?.outline || "").trim();
+      const outlineBlock = outline
+        ? `\n\n本科目大綱（請從中選一個最相關單元，**完全照抄單元名稱**）：\n${outline}`
+        : "";
       const data = await aiCall({
-        max_tokens: 1000,
+        max_tokens: 4096,
         messages: [{
           role: "user",
           content: [
             { type: "image", source: { type: "base64", media_type: "image/jpeg", data: imageData } },
             { type: "text", text: `你是一位${subjectLabel}學習助教。請分析這張筆記/課程頁面的圖片，請用繁體中文回答：
 
+**最開頭**請先輸出這兩行（後面才是正文）：
+標題：[15字內、能讓人一眼看懂這張圖在算/問什麼，例如「二次函數配方法求頂點」]
+所屬單元：${outline ? "[從下方大綱中選一個，完全照抄]" : "[依內容自行判定一個合理的單元名稱，例如「Ch.3 三角函數」]"}${outlineBlock}
+
+接著開始正文：
 1. **內容辨識**：辨識圖片中的文字、公式、電路圖等內容
 2. **正確性檢查**：如果發現錯誤，明確指出並提供正確版本
 3. **補充註解**：為重要概念加上補充說明
@@ -388,8 +585,14 @@ export default function StudyCompanion() {
         }],
       });
       const text = data.content?.map((c) => c.text || "").join("\n") || "無法分析此圖片";
-      setAiResult(text);
-      addNote({ content: text, type: "analysis" });
+      const titleMatch = text.match(/標題[:：]\s*(.+)/);
+      const unitMatch = text.match(/所屬單元[:：]\s*(.+)/);
+      const title = titleMatch ? titleMatch[1].trim().replace(/^\[|\]$/g, "") : "";
+      const unit = unitMatch ? unitMatch[1].trim().replace(/^\[|\]$/g, "") : "";
+      // 從顯示內容中移除這兩行 metadata
+      const cleanText = text.replace(/^\s*標題[:：].*\n?/m, "").replace(/^\s*所屬單元[:：].*\n?/m, "").trim();
+      setAiResult(cleanText);
+      addNote({ content: cleanText, type: "analysis", title, unit });
       setView("result");
     } catch (err) {
       setAiResult("分析時發生錯誤：" + err.message);
@@ -407,8 +610,12 @@ export default function StudyCompanion() {
 
     try {
       const subjectLabel = SUBJECTS[subject]?.label || "一般";
+      const outline = (SUBJECTS[subject]?.outline || "").trim();
+      const outlineBlock = outline
+        ? `\n\n本科目大綱（請從中選一個最相關單元，**完全照抄單元名稱**）：\n${outline}`
+        : "";
       const data = await aiCall({
-        max_tokens: 1000,
+        max_tokens: 2048,
         messages: [{
           role: "user",
           content: `你是一位${subjectLabel}學習助教。學生的問題：${q}
@@ -421,7 +628,7 @@ ${aiResult || "（無）"}
 最後附上：
 卡關摘要：[一句話]
 難度：[1-5]
-建議複習：[相關概念]`,
+建議複習：[相關概念]${outlineBlock ? "\n所屬單元：[從大綱選一個]" : ""}${outlineBlock}`,
         }],
       });
       const text = data.content?.map((c) => c.text || "").join("\n") || "無法回答";
@@ -430,12 +637,15 @@ ${aiResult || "（無）"}
       const summaryMatch = text.match(/卡關摘要：(.+)/);
       const difficultyMatch = text.match(/難度：(\d)/);
       const reviewMatch = text.match(/建議複習：(.+)/);
+      const unitMatch = text.match(/所屬單元：(.+)/);
       if (summaryMatch) {
         addStuckPoint({
           summary: summaryMatch[1].trim(),
           difficulty: difficultyMatch ? parseInt(difficultyMatch[1]) : 3,
           reviewTopic: reviewMatch ? reviewMatch[1].trim() : "",
+          unit: unitMatch ? unitMatch[1].trim().replace(/^\[|\]$/g, "") : "",
           question: q,
+          answer: text,
         });
       }
     } catch (err) {
@@ -447,9 +657,23 @@ ${aiResult || "（無）"}
   };
 
   const renderAIContent = (text) => {
+    // 處理粗體 **xxx** → <strong>
+    const renderInline = (s) => {
+      const parts = s.split(/(\*\*[^*]+\*\*)/g);
+      return parts.map((part, idx) => {
+        if (part.startsWith("**") && part.endsWith("**")) {
+          return <strong key={idx} style={{ fontWeight: 700, color: "#1a1a1a" }}>{part.slice(2, -2)}</strong>;
+        }
+        return <RenderWithMath key={idx} text={part} />;
+      });
+    };
+
     return text.split("\n").map((line, i) => {
-      if (!line.trim()) return null;
-      const isH2 = line.startsWith("## ");
+      if (!line.trim()) return <div key={i} style={{ height: 8 }} />;
+      const isH1 = /^#\s+/.test(line);
+      const isH2 = /^##\s+/.test(line);
+      const isH3 = /^###\s+/.test(line);
+      const isBullet = /^[-*]\s+/.test(line) || /^\d+\.\s+/.test(line);
       const isError = line.startsWith("❌");
       const isWarn = line.startsWith("⚠");
       const isTip = line.startsWith("💡");
@@ -458,16 +682,23 @@ ${aiResult || "（無）"}
       const hasMed = line.includes("[需驗證]");
       const hasLow = line.includes("[建議自行計算]");
       const conf = hasHigh ? "high" : hasMed ? "medium" : hasLow ? "low" : null;
-      const clean = line.replace(/\[高信心\]|\[需驗證\]|\[建議自行計算\]/g, "").replace(/^##\s*/, "");
+      const clean = line
+        .replace(/\[高信心\]|\[需驗證\]|\[建議自行計算\]/g, "")
+        .replace(/^#{1,3}\s*/, "")
+        .replace(/^[-*]\s+/, "")
+        .replace(/^\d+\.\s+/, "");
 
-      if (isH2) return <h3 key={i} style={{ fontSize: 15, fontWeight: 700, color: "#222", marginTop: 14, marginBottom: 4 }}><RenderWithMath text={clean} /></h3>;
+      if (isH1) return <h2 key={i} style={{ fontSize: 17, fontWeight: 700, color: "#1a1a1a", marginTop: 18, marginBottom: 6, paddingBottom: 4, borderBottom: "1px solid #eee" }}>{renderInline(clean)}</h2>;
+      if (isH2) return <h3 key={i} style={{ fontSize: 15, fontWeight: 700, color: "#222", marginTop: 14, marginBottom: 4 }}>{renderInline(clean)}</h3>;
+      if (isH3) return <h4 key={i} style={{ fontSize: 14, fontWeight: 600, color: "#333", marginTop: 10, marginBottom: 2 }}>{renderInline(clean)}</h4>;
 
       const bg = isError ? "#FFF0F0" : isWarn ? "#FFF8F0" : isTip ? "#F0FFF4" : "transparent";
       const bl = isError ? "#C62828" : isWarn ? "#E8590C" : isTip ? "#2B8A3E" : "transparent";
 
       return (
-        <div key={i} style={{ fontSize: 13, lineHeight: 1.75, color: "#444", padding: "5px 10px", borderRadius: 6, background: bg, borderLeft: bl !== "transparent" ? `3px solid ${bl}` : "none", display: "flex", alignItems: "baseline", gap: 6, flexWrap: "wrap", marginBottom: 2 }}>
-          <span style={{ flex: 1 }}><RenderWithMath text={clean} /></span>
+        <div key={i} style={{ fontSize: 13, lineHeight: 1.75, color: "#444", padding: bg !== "transparent" ? "6px 10px" : "2px 0", borderRadius: 6, background: bg, borderLeft: bl !== "transparent" ? `3px solid ${bl}` : "none", display: "flex", alignItems: "baseline", gap: 6, flexWrap: "wrap", marginBottom: 2, paddingLeft: isBullet ? 16 : (bg !== "transparent" ? 10 : 0) }}>
+          {isBullet && <span style={{ color: "#999", marginLeft: -10 }}>•</span>}
+          <span style={{ flex: 1 }}>{renderInline(clean)}</span>
           {conf && (
             <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 4, fontWeight: 500, whiteSpace: "nowrap", background: CONFIDENCE_STYLES[conf].bg, color: CONFIDENCE_STYLES[conf].text, border: `1px solid ${CONFIDENCE_STYLES[conf].border}` }}>
               {CONFIDENCE_STYLES[conf].label}
@@ -480,77 +711,392 @@ ${aiResult || "（無）"}
 
   // ===== VIEWS =====
   const P = ({ children }) => <div style={{ padding: "20px 18px", animation: "fadeUp 0.3s ease", maxWidth: 480, margin: "0 auto" }}>{children}</div>;
-  const Back = ({ to = "home", label = "← 返回" }) => <button onClick={() => { setView(to); if (to === "home") { setImage(null); setImageData(null); setAiResult(null); setFollowUp(null); } }} style={{ background: "none", border: "none", fontSize: 14, color: "#888", cursor: "pointer", padding: 0, fontFamily: "inherit" }}>{label}</button>;
+  const Back = ({ to = "home", label = "← 返回" }) => <button onClick={() => { setView(to); if (to === "home") { setImage(null); setImageData(null); setAiResult(null); setFollowUp(null); setSavedToStuck(false); } }} style={{ background: "none", border: "none", fontSize: 14, color: "#888", cursor: "pointer", padding: 0, fontFamily: "inherit" }}>{label}</button>;
 
-  if (view === "home") return (
-    <div style={{ fontFamily: "'Noto Sans TC', sans-serif", maxWidth: 480, margin: "0 auto", minHeight: "100vh", background: "#FAFAF8" }}>
-      <style>{`@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@300;400;500;700&display=swap');*{box-sizing:border-box;margin:0;padding:0}@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}`}</style>
+  if (view === "home") {
+    const hour = new Date().getHours();
+    const greeting = hour < 5 ? "夜深了" : hour < 11 ? "早安" : hour < 14 ? "中午好" : hour < 18 ? "午安" : hour < 22 ? "晚上好" : "夜深了";
+    const dueCount = stuckPoints.filter(p => !p.resolved && isDue(p)).length;
+    const unresolvedCount = stuckPoints.filter(p => !p.resolved).length;
+    const oneWeekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const weekNew = stuckPoints.filter(p => p.id > oneWeekAgo).length;
+    const totalNotes = notes.length;
+    // 下一張到期時間（用於 nav 顯示）
+    const nextDue = stuckPoints
+      .filter(p => !p.resolved && p.nextReviewAt)
+      .reduce((min, p) => (p.nextReviewAt < min ? p.nextReviewAt : min), Infinity);
+    const nextDueLabel = (() => {
+      if (dueCount > 0) return `複習 · ${dueCount}`;
+      if (unresolvedCount === 0) return "複習";
+      if (!isFinite(nextDue)) return "複習";
+      const diff = nextDue - Date.now();
+      const days = Math.ceil(diff / DAY_MS);
+      if (days <= 1) return "明日到期";
+      return `${days} 天後`;
+    })();
+
+    return (
+    <div style={{ fontFamily: "'Noto Sans TC', sans-serif", maxWidth: 480, margin: "0 auto", minHeight: "100vh", background: "#F5F6FA" }}>
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@300;400;500;700;900&display=swap');*{box-sizing:border-box;margin:0;padding:0}@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-4px)}}`}</style>
+
+      {/* 漸層 Hero */}
+      <div style={{ background: "linear-gradient(135deg,#1a1a1a 0%,#2d2d44 60%,#1971C2 100%)", color: "#fff", padding: "32px 22px 80px", position: "relative", overflow: "hidden" }}>
+        <div style={{ position: "absolute", top: -60, right: -40, width: 220, height: 220, borderRadius: "50%", background: "radial-gradient(circle,#ffffff20,transparent 70%)" }} />
+        <div style={{ position: "absolute", bottom: -80, left: -60, width: 200, height: 200, borderRadius: "50%", background: "radial-gradient(circle,#1971C230,transparent 70%)" }} />
+        <div style={{ position: "relative", zIndex: 1, maxWidth: 480, margin: "0 auto" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div>
+              <p style={{ fontSize: 13, opacity: 0.8 }}>{greeting} 👋</p>
+              <h1 style={{ fontSize: 24, fontWeight: 900, marginTop: 2, letterSpacing: 0.5 }}>學習戰友</h1>
+            </div>
+            <div style={{ width: 44, height: 44, borderRadius: 12, background: "#ffffff15", backdropFilter: "blur(10px)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22, fontWeight: 900, border: "1px solid #ffffff20" }}>學</div>
+          </div>
+          <p style={{ fontSize: 14, opacity: 0.7, marginTop: 14, lineHeight: 1.6 }}>任何要搞懂的事，<br/>都先拍一張。</p>
+
+          {/* AI 引擎切換（玻璃效果） */}
+          <div style={{ display: "flex", gap: 4, padding: 4, background: "#ffffff15", backdropFilter: "blur(10px)", borderRadius: 12, border: "1px solid #ffffff20", marginTop: 18 }}>
+            {Object.entries(AI_PROVIDERS).map(([key, val]) => {
+              const active = provider === key;
+              return (
+                <button key={key} onClick={() => setProvider(key)}
+                  style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "9px 6px", border: "none", borderRadius: 9, cursor: "pointer", fontFamily: "inherit", fontSize: 13, fontWeight: active ? 700 : 500, background: active ? "#fff" : "transparent", color: active ? "#1a1a1a" : "#fff", transition: "all 0.15s" }}>
+                  <span style={{ fontSize: 14 }}>{val.icon}</span>
+                  <span>{val.label}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
+      {/* 浮動統計卡 */}
+      <div style={{ maxWidth: 480, margin: "-58px auto 0", padding: "0 18px", position: "relative", zIndex: 2 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, background: "#fff", borderRadius: 16, padding: "16px 6px", boxShadow: "0 8px 30px rgba(0,0,0,0.08)" }}>
+          {[
+            { num: dueCount, label: "今日複習", color: "#E8590C", emoji: "🔥" },
+            { num: unresolvedCount, label: "未突破", color: "#1971C2", emoji: "🚧" },
+            { num: weekNew, label: "本週新增", color: "#2B8A3E", emoji: "✨" },
+          ].map((s, i) => (
+            <div key={i} style={{ textAlign: "center", borderRight: i < 2 ? "1px solid #f0f0f0" : "none", padding: "4px 6px" }}>
+              <div style={{ fontSize: 20 }}>{s.emoji}</div>
+              <div style={{ fontSize: 22, fontWeight: 900, color: s.color, marginTop: 2 }}>{s.num}</div>
+              <div style={{ fontSize: 11, color: "#888", marginTop: 1 }}>{s.label}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
       <P>
-        <div style={{ textAlign: "center", padding: "28px 0 20px" }}>
-          <div style={{ width: 56, height: 56, borderRadius: 14, background: "#1a1a1a", color: "#fff", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontWeight: 700 }}>學</div>
-          <h1 style={{ fontSize: 26, fontWeight: 700, marginTop: 10 }}>學習戰友</h1>
-          <p style={{ fontSize: 14, color: "#888", marginTop: 2 }}>拍照 → AI 分析 → 搞懂它</p>
-        </div>
+        {/* 主要 CTA：到期複習 */}
+        {dueCount > 0 && (
+          <button
+            onClick={() => { setCurrentCard(0); setShowAnswer(false); setView("review"); }}
+            style={{ width: "100%", marginTop: 20, padding: "16px 18px", border: "none", borderRadius: 14, cursor: "pointer", background: "linear-gradient(135deg,#E8590C,#FF8C42)", color: "#fff", fontFamily: "inherit", fontSize: 15, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "space-between", boxShadow: "0 6px 18px #E8590C40" }}>
+            <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <span style={{ fontSize: 22, animation: "float 2s ease-in-out infinite", display: "inline-block" }}>⚡</span>
+              <span>有 {dueCount} 張卡片等你複習</span>
+            </span>
+            <span style={{ fontSize: 18 }}>→</span>
+          </button>
+        )}
 
-        {/* AI 引擎切換 */}
-        <div style={{ display: "flex", gap: 6, padding: 4, background: "#fff", borderRadius: 10, border: "1px solid #eee" }}>
-          {Object.entries(AI_PROVIDERS).map(([key, val]) => {
-            const active = provider === key;
-            return (
-              <button key={key} onClick={() => setProvider(key)}
-                style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "8px 6px", border: "none", borderRadius: 7, cursor: "pointer", fontFamily: "inherit", fontSize: 13, fontWeight: active ? 600 : 400, background: active ? val.color : "transparent", color: active ? "#fff" : "#666", transition: "all 0.15s" }}>
-                <span style={{ fontSize: 14 }}>{val.icon}</span>
-                <span>{val.label}</span>
-              </button>
-            );
-          })}
-        </div>
-        <p style={{ fontSize: 11, color: "#aaa", marginTop: 4, textAlign: "center" }}>
-          {AI_PROVIDERS[provider]?.desc}
-        </p>
+        {/* #8 繼續上一題：快速回到最近一則分析 */}
+        {notes[0] && (() => {
+          const last = notes[0];
+          const subj = SUBJECTS[last.subject];
+          const preview = last.title || (last.content || "").replace(/^#+\s*/gm, "").replace(/\*\*/g, "").slice(0, 30);
+          return (
+            <button onClick={() => { setSelectedNote(last); setView("history"); }}
+              style={{ width: "100%", marginTop: dueCount > 0 ? 10 : 20, padding: "12px 14px", border: "1px solid #eef0f4", borderRadius: 12, cursor: "pointer", background: "#fff", fontFamily: "inherit", display: "flex", alignItems: "center", gap: 10, textAlign: "left", boxShadow: "0 2px 8px rgba(0,0,0,0.03)" }}>
+              <span style={{ fontSize: 20, width: 36, height: 36, borderRadius: 10, background: subj ? `${subj.color}15` : "#f0f0f0", color: subj?.color || "#888", display: "inline-flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                {subj?.icon || "📌"}
+              </span>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 11, color: "#999" }}>繼續上一題 · {last.timestamp}</div>
+                <div style={{ fontSize: 13, fontWeight: 600, color: "#1a1a1a", marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {preview}
+                </div>
+              </div>
+              <span style={{ color: "#bbb", fontSize: 16 }}>›</span>
+            </button>
+          );
+        })()}
 
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 20, marginBottom: 8 }}>
-          <span style={{ fontSize: 13, fontWeight: 600, color: "#555" }}>科目（{Object.keys(SUBJECTS).length}）</span>
+        {/* 科目區 */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 22, marginBottom: 10 }}>
+          <h2 style={{ fontSize: 16, fontWeight: 700, color: "#1a1a1a" }}>選擇科目開始</h2>
           <button onClick={() => setView("subjects")}
-            style={{ fontSize: 12, color: "#1971C2", background: "none", border: "none", cursor: "pointer", fontFamily: "inherit" }}>
+            style={{ fontSize: 12, color: "#1971C2", background: "none", border: "none", cursor: "pointer", fontFamily: "inherit", fontWeight: 500 }}>
             管理 →
           </button>
         </div>
 
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-          {Object.entries(SUBJECTS).map(([key, val]) => (
-            <button key={key} onClick={() => { setSubject(key); setView("upload"); }}
-              style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 12px", border: "1px solid #e8e8e8", borderRadius: 10, cursor: "pointer", background: "#fff", fontFamily: "inherit", fontSize: 14, textAlign: "left", borderLeft: `4px solid ${val.color}` }}>
-              <span style={{ fontSize: 24 }}>{val.icon}</span>
-              <span style={{ fontWeight: 500 }}>{val.label}</span>
+          {Object.entries(SUBJECTS).slice(0, showAllSubjects ? Object.keys(SUBJECTS).length : 6).map(([key, val]) => (
+            <button key={key} onClick={() => { setSubject(key); setView("subject-home"); }}
+              style={{ position: "relative", display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 6, padding: "16px 14px", border: "1px solid #eef0f4", borderRadius: 14, cursor: "pointer", background: "#fff", fontFamily: "inherit", textAlign: "left", boxShadow: "0 2px 8px rgba(0,0,0,0.03)", transition: "transform 0.15s", overflow: "hidden" }}
+              onMouseDown={(e) => e.currentTarget.style.transform = "scale(0.97)"}
+              onMouseUp={(e) => e.currentTarget.style.transform = ""}
+              onMouseLeave={(e) => e.currentTarget.style.transform = ""}>
+              <div style={{ position: "absolute", top: 0, right: 0, width: 50, height: 50, background: `radial-gradient(circle at top right,${val.color}25,transparent 70%)`, pointerEvents: "none" }} />
+              <span style={{ fontSize: 26, width: 40, height: 40, borderRadius: 10, background: `${val.color}15`, display: "inline-flex", alignItems: "center", justifyContent: "center", color: val.color }}>{val.icon}</span>
+              <span style={{ fontWeight: 600, fontSize: 14, color: "#1a1a1a" }}>{val.label}</span>
+              <span style={{ fontSize: 11, color: "#999" }}>{notes.filter(n => n.subject === key).length} 則筆記</span>
             </button>
           ))}
+          {Object.keys(SUBJECTS).length > 6 && !showAllSubjects && (
+            <button onClick={() => setShowAllSubjects(true)}
+              style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4, padding: "16px 12px", border: "1px solid #eef0f4", borderRadius: 14, cursor: "pointer", background: "#fff", fontFamily: "inherit", fontSize: 13, color: "#1971C2", fontWeight: 600, minHeight: 100, boxShadow: "0 2px 8px rgba(0,0,0,0.03)" }}>
+              <span style={{ fontSize: 22 }}>⋯</span>
+              <span>展開全部</span>
+              <span style={{ fontSize: 11, color: "#999", fontWeight: 400 }}>還有 {Object.keys(SUBJECTS).length - 6} 個</span>
+            </button>
+          )}
           <button onClick={() => { openSubjectEditor("new"); setView("subjects"); }}
-            style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "14px 12px", border: "1.5px dashed #ccc", borderRadius: 10, cursor: "pointer", background: "transparent", fontFamily: "inherit", fontSize: 13, color: "#888" }}>
-            <span style={{ fontSize: 20 }}>+</span>
+            style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4, padding: "16px 12px", border: "1.5px dashed #d0d4dc", borderRadius: 14, cursor: "pointer", background: "transparent", fontFamily: "inherit", fontSize: 13, color: "#888", minHeight: 100 }}>
+            <span style={{ fontSize: 24 }}>+</span>
             <span>新增科目</span>
           </button>
         </div>
 
-        <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
-          <button style={{ flex: 1, display: "flex", alignItems: "center", gap: 10, padding: "12px 10px", border: "1px solid #e8e8e8", borderRadius: 10, cursor: "pointer", background: "#fff", fontFamily: "inherit", textAlign: "left" }} onClick={() => setView("stuck")}>
-            <span style={{ fontSize: 22 }}>🚧</span>
-            <div><div style={{ fontWeight: 500, fontSize: 13 }}>卡關大全</div><div style={{ fontSize: 11, color: "#999" }}>{stuckPoints.length} 個待突破</div></div>
-          </button>
-          <button style={{ flex: 1, display: "flex", alignItems: "center", gap: 10, padding: "12px 10px", border: "1px solid #e8e8e8", borderRadius: 10, cursor: "pointer", background: "#fff", fontFamily: "inherit", textAlign: "left" }} onClick={() => { if (stuckPoints.filter(p => !p.resolved && isDue(p)).length > 0) { setCurrentCard(0); setShowAnswer(false); setView("review"); } }}>
-            <span style={{ fontSize: 22 }}>🔄</span>
-            <div><div style={{ fontWeight: 500, fontSize: 13 }}>間隔複習</div><div style={{ fontSize: 11, color: "#999" }}>{stuckPoints.filter(p => !p.resolved && isDue(p)).length} 張今日到期</div></div>
+        {/* #10 儲存警示（只在 quota / error 時出現） */}
+        {storageWarn && (
+          <div style={{ marginTop: 18, padding: "12px 14px", borderRadius: 12, background: storageWarn === "quota" ? "#FFF3E0" : "#FFEBEE", border: `1px solid ${storageWarn === "quota" ? "#E8590C" : "#C62828"}`, display: "flex", alignItems: "flex-start", gap: 10 }}>
+            <span style={{ fontSize: 20 }}>{storageWarn === "quota" ? "⚠️" : "❌"}</span>
+            <div style={{ flex: 1, fontSize: 12, lineHeight: 1.6, color: storageWarn === "quota" ? "#BF360C" : "#B71C1C" }}>
+              <div style={{ fontWeight: 700, marginBottom: 2 }}>
+                {storageWarn === "quota" ? "瀏覽器儲存空間不足" : "資料寫入失敗"}
+              </div>
+              <div>
+                {storageWarn === "quota"
+                  ? "新資料可能未被保存。請「匯出備份」後刪除部分舊紀錄。"
+                  : "請檢查是否使用無痕模式或關閉了 cookie / storage。"}
+              </div>
+              <button onClick={() => setView("subjects")}
+                style={{ marginTop: 6, padding: "6px 10px", border: "none", borderRadius: 6, background: storageWarn === "quota" ? "#E8590C" : "#C62828", color: "#fff", fontSize: 11, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>
+                前往備份 →
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* 入口提示文：#7 已用過 ≥5 則或手動關閉後就隱藏 */}
+        {!hintDismissed && totalNotes < 5 && (
+          <div style={{ marginTop: 22, padding: "10px 14px", borderRadius: 10, background: "#fff", border: "1px solid #eef0f4", position: "relative" }}>
+            <button onClick={dismissHint} aria-label="關閉提示"
+              style={{ position: "absolute", top: 4, right: 6, background: "none", border: "none", color: "#bbb", fontSize: 14, cursor: "pointer", padding: "4px 8px", fontFamily: "inherit", lineHeight: 1 }}>×</button>
+            <p style={{ fontSize: 11, color: "#888", textAlign: "center", lineHeight: 1.7 }}>
+              📷 拍題 → 🧠 AI 解析存「歷史」<br/>
+              🤔 追問不懂 → 自動進「卡關」 → 🔄 排程「複習」
+            </p>
+          </div>
+        )}
+        <p style={{ fontSize: 11, color: "#bbb", textAlign: "center", marginTop: 12, paddingBottom: 110 }}>
+          {AI_PROVIDERS[provider]?.desc} · 累積 {totalNotes} 則筆記
+        </p>
+      </P>
+
+      {/* ===== 底部固定導航 + 中央拍照 CTA ===== */}
+      <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, zIndex: 50, pointerEvents: "none" }}>
+        <div style={{ maxWidth: 480, margin: "0 auto", position: "relative", pointerEvents: "auto" }}>
+          <div style={{ background: "#fff", borderTop: "1px solid #eef0f4", boxShadow: "0 -4px 20px rgba(0,0,0,0.06)", padding: "10px 8px 14px", display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr 1fr", alignItems: "center", borderTopLeftRadius: 20, borderTopRightRadius: 20 }}>
+            <button onClick={() => setView("home")}
+              style={{ background: "none", border: "none", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 2, fontFamily: "inherit", color: "#1a1a1a" }}>
+              <span style={{ fontSize: 20 }}>🏠</span>
+              <span style={{ fontSize: 10, fontWeight: 600 }}>首頁</span>
+            </button>
+            <button onClick={() => setView("stuck")}
+              style={{ background: "none", border: "none", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 2, fontFamily: "inherit", color: "#666" }}>
+              <span style={{ fontSize: 20 }}>🚧</span>
+              <span style={{ fontSize: 10 }}>卡關 {unresolvedCount > 0 && `· ${unresolvedCount}`}</span>
+            </button>
+            <div style={{ pointerEvents: "none" }} /> {/* 中央留空給浮動 CTA */}
+            <button onClick={() => {
+              if (dueCount > 0) { setCurrentCard(0); setShowAnswer(false); setView("review"); }
+              else { setView("stuck"); }
+            }}
+              title={dueCount > 0 ? "開始複習" : (unresolvedCount === 0 ? "尚無卡關" : `下一張：${nextDueLabel}`)}
+              style={{ background: "none", border: "none", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 2, fontFamily: "inherit", color: dueCount > 0 ? "#E8590C" : "#999" }}>
+              <span style={{ fontSize: 20 }}>{dueCount > 0 ? "🔄" : (unresolvedCount === 0 ? "✅" : "📅")}</span>
+              <span style={{ fontSize: 10, fontWeight: dueCount > 0 ? 600 : 400 }}>{nextDueLabel}</span>
+            </button>
+            <button onClick={() => { setSelectedNote(null); setView("history"); }}
+              style={{ background: "none", border: "none", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 2, fontFamily: "inherit", color: "#666" }}>
+              <span style={{ fontSize: 20 }}>📖</span>
+              <span style={{ fontSize: 10 }}>歷史</span>
+            </button>
+          </div>
+
+          {/* 中央懸浮拍照 CTA（白色外圈讓主動作「浮」在 nav 之上） */}
+          <button onClick={() => setPickerOpen(true)}
+            aria-label="拍照 / 上傳新題目"
+            style={{ position: "absolute", left: "50%", top: -26, transform: "translateX(-50%)", width: 62, height: 62, borderRadius: "50%", border: "5px solid #fff", background: "linear-gradient(135deg,#1971C2,#5F3DC4)", color: "#fff", fontSize: 24, cursor: "pointer", boxShadow: "0 6px 20px rgba(25,113,194,0.45)", fontFamily: "inherit", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 2 }}>
+            📷
           </button>
         </div>
-      </P>
+      </div>
+
+      {/* ===== 拍照 CTA: 科目選擇 Sheet ===== */}
+      {pickerOpen && (
+        <div onClick={() => setPickerOpen(false)}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", zIndex: 100, display: "flex", alignItems: "flex-end", justifyContent: "center", animation: "fadeUp 0.2s ease-out" }}>
+          <div onClick={(e) => e.stopPropagation()}
+            style={{ width: "100%", maxWidth: 480, background: "#fff", borderTopLeftRadius: 22, borderTopRightRadius: 22, padding: "20px 20px 28px", maxHeight: "75vh", overflowY: "auto" }}>
+            <div style={{ width: 40, height: 4, background: "#e0e0e0", borderRadius: 2, margin: "0 auto 16px" }} />
+            <h3 style={{ fontSize: 17, fontWeight: 700, textAlign: "center", marginBottom: 4 }}>📷 要拍哪個科目？</h3>
+            <p style={{ fontSize: 12, color: "#888", textAlign: "center", marginBottom: 18 }}>選擇後就能拍照 / 上傳</p>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              {Object.entries(SUBJECTS).map(([key, val]) => (
+                <button key={key}
+                  onClick={() => { setSubject(key); setPickerOpen(false); setView("upload"); }}
+                  style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px", border: "1px solid #eef0f4", borderRadius: 12, cursor: "pointer", background: "#fff", fontFamily: "inherit", textAlign: "left" }}>
+                  <span style={{ fontSize: 22, width: 36, height: 36, borderRadius: 10, background: `${val.color}15`, color: val.color, display: "inline-flex", alignItems: "center", justifyContent: "center" }}>{val.icon}</span>
+                  <span style={{ fontWeight: 600, fontSize: 13 }}>{val.label}</span>
+                </button>
+              ))}
+            </div>
+            <button onClick={() => setPickerOpen(false)}
+              style={{ width: "100%", marginTop: 14, padding: 12, border: "1px solid #ddd", borderRadius: 10, background: "#fff", fontFamily: "inherit", fontSize: 13, color: "#666", cursor: "pointer" }}>
+              取消
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
+  }
+
+  if (view === "subject-home") {
+    const subj = SUBJECTS[subject];
+    if (!subj) { setView("home"); return null; }
+    const subjNotes = notes.filter(n => n.subject === subject).sort((a, b) => (b.id || 0) - (a.id || 0));
+    const subjStuck = stuckPoints.filter(p => p.subject === subject);
+    const unresolvedStuck = subjStuck.filter(p => !p.resolved);
+    const outlineUnits = (subj.outline || "").split("\n").map(s => s.trim()).filter(Boolean);
+
+    return (
+      <div style={{ fontFamily: "'Noto Sans TC', sans-serif", maxWidth: 480, margin: "0 auto", minHeight: "100vh", background: "#FAFAF8" }}>
+        <style>{`@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@300;400;500;700&display=swap');*{box-sizing:border-box;margin:0;padding:0}@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}`}</style>
+
+        {/* 科目專屬 Hero */}
+        <div style={{ background: `linear-gradient(135deg,${subj.color},${subj.color}cc)`, color: "#fff", padding: "22px 20px 60px", position: "relative", overflow: "hidden" }}>
+          <div style={{ position: "absolute", top: -40, right: -30, width: 160, height: 160, borderRadius: "50%", background: "#ffffff20" }} />
+          <div style={{ position: "relative", zIndex: 1, maxWidth: 480, margin: "0 auto" }}>
+            <Back />
+            <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 14 }}>
+              <span style={{ fontSize: 36, width: 56, height: 56, borderRadius: 14, background: "#ffffff25", display: "inline-flex", alignItems: "center", justifyContent: "center" }}>{subj.icon}</span>
+              <div>
+                <h2 style={{ fontSize: 22, fontWeight: 900 }}>{subj.label}</h2>
+                <p style={{ fontSize: 12, opacity: 0.85, marginTop: 2 }}>
+                  {subjNotes.length} 則筆記 · {unresolvedStuck.length} 個卡關 · {outlineUnits.length} 章節
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* 主要 CTA + 編輯科目 */}
+        <div style={{ maxWidth: 480, margin: "-42px auto 0", padding: "0 18px", position: "relative", zIndex: 2 }}>
+          <button onClick={() => setView("upload")}
+            style={{ width: "100%", padding: "16px 18px", border: "none", borderRadius: 14, cursor: "pointer", background: "#1a1a1a", color: "#fff", fontFamily: "inherit", fontSize: 15, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "space-between", boxShadow: "0 8px 24px rgba(0,0,0,0.15)" }}>
+            <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <span style={{ fontSize: 22 }}>📷</span>
+              <span>拍照 / 上傳新題目</span>
+            </span>
+            <span style={{ fontSize: 18 }}>→</span>
+          </button>
+
+          <button onClick={() => { openSubjectEditor(subject); setView("subjects"); }}
+            style={{ width: "100%", marginTop: 8, padding: "10px", border: "1px solid #eef0f4", borderRadius: 10, cursor: "pointer", background: "#fff", fontFamily: "inherit", fontSize: 12, color: "#666" }}>
+            ⚙️ 編輯此科目（含大綱）
+          </button>
+        </div>
+
+        <P>
+          {/* 大綱概覽（若有；階層化呈現） */}
+          {outlineUnits.length > 0 && (() => {
+            const groups = parseOutline(subj.outline);
+            return (
+              <details style={{ marginTop: 18, background: "#fff", padding: "10px 14px 14px", borderRadius: 10, border: "1px solid #eef0f4" }}>
+                <summary style={{ cursor: "pointer", fontSize: 13, fontWeight: 600, color: "#444" }}>
+                  📋 課程大綱（{groups.filter(g => g.parent).length || groups.length} 章 · {outlineUnits.length} 項）
+                </summary>
+                <div style={{ marginTop: 10 }}>
+                  {groups.map((g, gi) => (
+                    <div key={gi} style={{ marginBottom: 10 }}>
+                      {g.parent && (
+                        <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, fontWeight: 700, color: subj.color, marginBottom: 6, paddingBottom: 4, borderBottom: `2px solid ${subj.color}25` }}>
+                          <span style={{ width: 3, height: 14, background: subj.color, borderRadius: 2 }} />
+                          {g.parent}
+                        </div>
+                      )}
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 5, paddingLeft: g.parent ? 9 : 0 }}>
+                        {g.children.map(u => (
+                          <span key={u} style={{ fontSize: 11, padding: "3px 9px", borderRadius: 12, background: `${subj.color}10`, color: subj.color, border: `1px solid ${subj.color}25` }}>{u}</span>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            );
+          })()}
+
+          {/* 此科目卡關 */}
+          {unresolvedStuck.length > 0 && (
+            <div style={{ marginTop: 18 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                <h3 style={{ fontSize: 14, fontWeight: 700, color: "#1a1a1a" }}>🚧 卡關（{unresolvedStuck.length}）</h3>
+                <button onClick={() => setView("stuck")} style={{ fontSize: 11, color: "#1971C2", background: "none", border: "none", cursor: "pointer", fontFamily: "inherit" }}>全部 →</button>
+              </div>
+              {unresolvedStuck.slice(0, 3).map(pt => (
+                <div key={pt.id} style={{ background: "#fff", padding: "10px 12px", borderRadius: 10, border: "1px solid #eef0f4", marginBottom: 6, borderLeft: `3px solid ${subj.color}` }}>
+                  {pt.unit && <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: `${subj.color}15`, color: subj.color, marginRight: 6 }}>{pt.unit}</span>}
+                  <span style={{ fontSize: 13, color: "#333" }}>{pt.summary}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* 此科目歷史 */}
+          <div style={{ marginTop: 18 }}>
+            <h3 style={{ fontSize: 14, fontWeight: 700, color: "#1a1a1a", marginBottom: 8 }}>
+              📖 學習紀錄（{subjNotes.length}）
+            </h3>
+            {subjNotes.length === 0 ? (
+              <div style={{ textAlign: "center", padding: "32px 20px", color: "#999", background: "#fff", borderRadius: 10, border: "1px dashed #e5e5e5" }}>
+                <span style={{ fontSize: 32 }}>📭</span>
+                <p style={{ marginTop: 8, fontSize: 13 }}>還沒有任何題目分析</p>
+                <p style={{ fontSize: 11, color: "#bbb", marginTop: 4 }}>點上方「拍照 / 上傳新題目」開始</p>
+              </div>
+            ) : subjNotes.map(n => {
+              const preview = (n.content || "").replace(/^#+\s*/gm, "").replace(/\*\*/g, "").slice(0, 70);
+              return (
+                <button key={n.id} onClick={() => { setSelectedNote(n); setView("history"); }}
+                  style={{ width: "100%", textAlign: "left", background: "#fff", padding: "12px 14px", borderRadius: 10, border: "1px solid #eef0f4", marginBottom: 6, cursor: "pointer", fontFamily: "inherit", display: "block" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4, gap: 6 }}>
+                    <span style={{ fontSize: 11, color: "#999" }}>{n.timestamp}</span>
+                    {n.unit && <span style={{ fontSize: 10, padding: "2px 7px", borderRadius: 4, background: `${subj.color}15`, color: subj.color, fontWeight: 500 }}>📍 {n.unit}</span>}
+                  </div>
+                  {n.title ? (
+                    <p style={{ fontSize: 14, fontWeight: 600, color: "#1a1a1a", lineHeight: 1.4, margin: 0 }}>{n.title}</p>
+                  ) : (
+                    <p style={{ fontSize: 13, color: "#444", lineHeight: 1.5, margin: 0 }}>{preview}{preview.length >= 70 ? "..." : ""}</p>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </P>
+      </div>
+    );
+  }
 
   if (view === "upload") return (
     <div style={{ fontFamily: "'Noto Sans TC', sans-serif", maxWidth: 480, margin: "0 auto", minHeight: "100vh", background: "#FAFAF8" }}>
       <style>{`@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@300;400;500;700&display=swap');*{box-sizing:border-box;margin:0;padding:0}@keyframes spin{to{transform:rotate(360deg)}}@keyframes fillBar{from{width:0%}to{width:92%}}@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}`}</style>
       <P>
-        <Back />
+        <Back to="subject-home" />
         <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 12 }}>
           <span style={{ fontSize: 28 }}>{SUBJECTS[subject]?.icon}</span>
           <h2 style={{ fontSize: 20, fontWeight: 700 }}>{SUBJECTS[subject]?.label}</h2>
@@ -563,23 +1109,34 @@ ${aiResult || "（無）"}
               onDragLeave={(e) => { e.preventDefault(); setIsDragging(false); }}
               onDragOver={(e) => e.preventDefault()}
               onDrop={handleDrop}
-              style={{ marginTop: 20, padding: "40px 20px", border: `2px dashed ${isDragging ? SUBJECTS[subject]?.color : "#ccc"}`, borderRadius: 14, textAlign: "center", background: isDragging ? `${SUBJECTS[subject]?.color}10` : "#fff", transition: "all 0.2s" }}>
-              <span style={{ fontSize: 40, opacity: 0.6 }}>📋</span>
-              <p style={{ fontSize: 16, fontWeight: 500, marginTop: 10, color: "#444" }}>拖放圖片到這裡</p>
-              <p style={{ fontSize: 13, color: "#888", marginTop: 4 }}>或 <strong>Ctrl+V</strong> 貼上截圖</p>
-              <p style={{ fontSize: 12, color: "#aaa", marginTop: 4 }}>支援 JPG、PNG 格式</p>
+              style={{ marginTop: 20, padding: "32px 20px", border: `2px dashed ${isDragging ? SUBJECTS[subject]?.color : "#d6d6d6"}`, borderRadius: 16, textAlign: "center", background: isDragging ? `${SUBJECTS[subject]?.color}15` : "#fff", transition: "all 0.2s" }}>
+              <span style={{ fontSize: 36, opacity: 0.5 }}>📋</span>
+              <p style={{ fontSize: 14, color: "#888", marginTop: 8 }}>拖放圖片 / <strong>Ctrl+V</strong> 貼上截圖</p>
             </div>
 
-            <div style={{ textAlign: "center", margin: "18px 0", fontSize: 13, color: "#bbb" }}>— 或 —</div>
+            {/* 主要上傳按鈕（拍照 / 相簿）— 手機友善 */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 12 }}>
+              <label
+                style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 6, padding: "18px 10px", border: "none", borderRadius: 14, cursor: "pointer", background: SUBJECTS[subject]?.color, color: "#fff", fontFamily: "inherit", fontSize: 14, fontWeight: 600, boxShadow: `0 4px 14px ${SUBJECTS[subject]?.color}40` }}>
+                <span style={{ fontSize: 26 }}>📷</span>
+                <span>拍照</span>
+                <input type="file" accept="image/*" capture="environment" onChange={handleFilePick} style={{ display: "none" }} />
+              </label>
+              <label
+                style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 6, padding: "18px 10px", border: `2px solid ${SUBJECTS[subject]?.color}`, borderRadius: 14, cursor: "pointer", background: "#fff", color: SUBJECTS[subject]?.color, fontFamily: "inherit", fontSize: 14, fontWeight: 600 }}>
+                <span style={{ fontSize: 26 }}>🖼️</span>
+                <span>從相簿選</span>
+                <input type="file" accept="image/*" onChange={handleFilePick} style={{ display: "none" }} />
+              </label>
+            </div>
+
+            <div style={{ textAlign: "center", margin: "16px 0 10px", fontSize: 12, color: "#bbb" }}>— 或 —</div>
             <button
               onClick={() => analyzeImage(true)}
               disabled={loading}
-              style={{ width: "100%", padding: "14px", border: `2px solid ${SUBJECTS[subject]?.color}`, borderRadius: 10, cursor: "pointer", fontSize: 15, fontWeight: 600, background: "#fff", fontFamily: "inherit", color: SUBJECTS[subject]?.color }}>
-              {loading ? <span style={{ display: "flex", alignItems: "center", gap: 6, justifyContent: "center" }}><span style={{ animation: "spin 1s linear infinite", display: "inline-block" }}>◌</span> 分析中...</span> : "🎮 用範例體驗完整流程"}
+              style={{ width: "100%", padding: "12px", border: "1px dashed #d0d0d0", borderRadius: 10, cursor: "pointer", fontSize: 13, fontWeight: 500, background: "#fff", fontFamily: "inherit", color: "#666" }}>
+              {loading ? <span style={{ display: "flex", alignItems: "center", gap: 6, justifyContent: "center" }}><span style={{ animation: "spin 1s linear infinite", display: "inline-block" }}>◌</span> 分析中...</span> : `🎮 用範例體驗（${SUBJECTS[subject]?.label}）`}
             </button>
-            <p style={{ fontSize: 12, color: "#aaa", marginTop: 6, textAlign: "center", lineHeight: 1.5 }}>
-              使用預設的{SUBJECTS[subject]?.label}筆記，體驗完整的分析→提問→卡關記錄流程
-            </p>
           </div>
         ) : (
           <div style={{ marginTop: 16 }}>
@@ -606,18 +1163,64 @@ ${aiResult || "（無）"}
     </div>
   );
 
-  if (view === "result") return (
+  if (view === "result") {
+    // sticky 頂部操作列需要的資料
+    const latestNote = notes[0];
+    const stickyTitle = latestNote?.title
+      || (aiResult && aiResult.split("\n").find(l => l.trim())?.replace(/^#+\s*/, "").slice(0, 30))
+      || "未命名";
+    const stickyUnit = latestNote?.unit || "";
+    const handleSaveStuck = () => {
+      if (savedToStuck || !aiResult) return;
+      addStuckPoint({
+        summary: stickyTitle,
+        difficulty: 3,
+        reviewTopic: "",
+        unit: stickyUnit,
+        question: stickyTitle,
+        answer: aiResult,
+      });
+      setSavedToStuck(true);
+    };
+    const handleNextImage = () => {
+      setView("upload"); setImage(null); setImageData(null); setAiResult(null); setFollowUp(null); setSavedToStuck(false);
+    };
+    return (
     <div style={{ fontFamily: "'Noto Sans TC', sans-serif", maxWidth: 480, margin: "0 auto", minHeight: "100vh", background: "#FAFAF8" }}>
       <style>{`@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@300;400;500;700&display=swap');*{box-sizing:border-box;margin:0;padding:0}@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}`}</style>
-      <P>
-        <Back />
-        <h2 style={{ fontSize: 20, fontWeight: 700, marginTop: 12 }}>{SUBJECTS[subject]?.icon} 分析結果</h2>
 
-        <div style={{ display: "flex", gap: 5, marginTop: 8, marginBottom: 14, flexWrap: "wrap" }}>
+      {/* Sticky 頂部操作列 */}
+      <div style={{ position: "sticky", top: 0, zIndex: 20, background: "rgba(250,250,248,0.92)", backdropFilter: "blur(10px)", borderBottom: "1px solid #eef0f4" }}>
+        <div style={{ maxWidth: 480, margin: "0 auto", padding: "10px 14px", display: "flex", alignItems: "center", gap: 8 }}>
+          <button onClick={() => { setView("home"); setImage(null); setImageData(null); setAiResult(null); setFollowUp(null); setSavedToStuck(false); }}
+            style={{ background: "none", border: "none", fontSize: 18, cursor: "pointer", color: "#666", padding: "4px 8px" }}>←</button>
+          <span style={{ fontSize: 13, fontWeight: 600, color: "#1a1a1a", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {SUBJECTS[subject]?.icon} {stickyTitle}
+          </span>
+          <button onClick={handleSaveStuck} disabled={savedToStuck}
+            title={savedToStuck ? "已加入卡關" : "加入卡關·之後複習"}
+            style={{ padding: "6px 10px", border: `1px solid ${savedToStuck ? "#2B8A3E" : "#E8590C"}`, borderRadius: 8, background: savedToStuck ? "#E6F9E8" : "#FFF4E6", color: savedToStuck ? "#1B5E20" : "#BF360C", fontSize: 12, fontWeight: 600, cursor: savedToStuck ? "default" : "pointer", fontFamily: "inherit", whiteSpace: "nowrap" }}>
+            {savedToStuck ? "✓ 已收藏" : "🚧 收藏"}
+          </button>
+          <button onClick={handleNextImage}
+            title="分析下一張"
+            style={{ padding: "6px 10px", border: "none", borderRadius: 8, background: "#1a1a1a", color: "#fff", fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "inherit", whiteSpace: "nowrap" }}>
+            下一張 →
+          </button>
+        </div>
+      </div>
+
+      <P>
+        <h2 style={{ fontSize: 20, fontWeight: 700, marginTop: 4 }}>{SUBJECTS[subject]?.icon} 分析結果</h2>
+
+        <div style={{ display: "flex", gap: 5, marginTop: 8, marginBottom: 6, flexWrap: "wrap" }}>
           {Object.entries(CONFIDENCE_STYLES).map(([k, v]) => (
             <span key={k} style={{ fontSize: 10, padding: "2px 7px", borderRadius: 5, fontWeight: 500, background: v.bg, color: v.text, border: `1px solid ${v.border}` }}>{v.label}</span>
           ))}
         </div>
+        <p style={{ fontSize: 11, color: "#888", marginBottom: 14, display: "flex", alignItems: "center", gap: 4 }}>
+          <span>💾</span> 已自動保存至「歷史」
+        </p>
 
         <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
           {aiResult && renderAIContent(aiResult)}
@@ -638,18 +1241,21 @@ ${aiResult || "（無）"}
           {followUp && (
             <div style={{ marginTop: 12, padding: 12, background: "#fff", borderRadius: 8, border: "1px solid #e0e0e0" }}>
               <div style={{ fontSize: 12, color: "#888", marginBottom: 6, fontWeight: 500 }}>AI 助教回答：</div>
-              {followUp.split("\n").map((l, i) => l.trim() ? <p key={i} style={{ fontSize: 13, lineHeight: 1.7, color: "#333", marginBottom: 3 }}><RenderWithMath text={l} /></p> : null)}
+              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                {renderAIContent(followUp)}
+              </div>
             </div>
           )}
         </div>
 
-        <button onClick={() => { setView("upload"); setImage(null); setImageData(null); setAiResult(null); setFollowUp(null); }}
+        <button onClick={handleNextImage}
           style={{ marginTop: 18, width: "100%", padding: "13px", background: "#1a1a1a", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 14, fontWeight: 500, fontFamily: "inherit" }}>
           分析下一張 →
         </button>
       </P>
     </div>
-  );
+    );
+  }
 
   if (view === "subjects") {
     const counts = stuckPoints.reduce((acc, p) => {
@@ -706,6 +1312,36 @@ ${aiResult || "（無）"}
                 ))}
               </div>
 
+              <label style={{ fontSize: 12, color: "#666", display: "block", marginBottom: 4 }}>
+                📋 大綱 / 章節（可選，每行一個單元）
+              </label>
+
+              {/* 拍照識別大綱（支援多張） */}
+              <label style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, padding: "10px 12px", border: `1.5px dashed ${subjectForm.color}`, borderRadius: 8, cursor: outlineExtracting ? "wait" : "pointer", background: outlineExtracting ? "#f5f5f5" : `${subjectForm.color}08`, color: subjectForm.color, fontFamily: "inherit", fontSize: 13, fontWeight: 600, marginBottom: 8, opacity: outlineExtracting ? 0.7 : 1 }}>
+                <span style={{ fontSize: 18 }}>{outlineExtracting ? "◌" : "📷"}</span>
+                <span>
+                  {outlineExtracting
+                    ? (outlineProgress.total > 0
+                        ? `AI 正在分析 ${outlineProgress.total} 張圖片...（約 ${Math.max(5, outlineProgress.total * 4)} 秒）`
+                        : "讀取圖片中...")
+                    : "拍照識別大綱（可選多張）"}
+                </span>
+                <input type="file" accept="image/*" multiple disabled={outlineExtracting}
+                  onChange={(e) => { extractOutlineFromImages(e.target.files); e.target.value = ""; }}
+                  style={{ display: "none" }} />
+              </label>
+
+              <textarea
+                value={subjectForm.outline || ""}
+                onChange={(e) => setSubjectForm({ ...subjectForm, outline: e.target.value })}
+                placeholder={"例如：\nCh.1 微分基礎\nCh.2 積分技巧\nCh.3 級數收斂\nCh.4 多變數函數"}
+                rows={6}
+                style={{ width: "100%", padding: "9px 12px", border: "1px solid #ddd", borderRadius: 6, fontSize: 13, fontFamily: "inherit", outline: "none", marginBottom: 6, resize: "vertical", lineHeight: 1.6 }}
+              />
+              <p style={{ fontSize: 11, color: "#999", marginBottom: 14, lineHeight: 1.5 }}>
+                💡 拍照課本目錄頁、課程大綱投影片，AI 會自動整理。之後問問題會自動歸類，可手動更正。
+              </p>
+
               <div style={{ display: "flex", gap: 8 }}>
                 <button onClick={() => setEditingSubject(null)}
                   style={{ flex: 1, padding: "10px", border: "1px solid #ddd", borderRadius: 6, cursor: "pointer", background: "#fff", fontSize: 13, fontFamily: "inherit" }}>
@@ -744,6 +1380,36 @@ ${aiResult || "（無）"}
               <p style={{ marginTop: 10 }}>還沒有科目，點右上「+ 新增」開始吧</p>
             </div>
           )}
+
+          {/* 資料備份／還原 */}
+          {!editing && (
+            <div style={{ marginTop: 28, padding: "14px 16px", background: "#fff", borderRadius: 12, border: "1px solid #eef0f4" }}>
+              <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 4 }}>💾 資料備份</h3>
+              <p style={{ fontSize: 11, color: "#888", marginBottom: 12, lineHeight: 1.6 }}>
+                資料只存在這個瀏覽器，清快取或換裝置都會消失。<br/>建議定期匯出 JSON 備份。
+              </p>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={exportData}
+                  style={{ flex: 1, padding: "10px", border: "1px solid #1971C2", borderRadius: 8, background: "#fff", color: "#1971C2", fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>
+                  ⬇ 匯出備份
+                </button>
+                <label style={{ flex: 1, padding: "10px", border: "1px solid #2B8A3E", borderRadius: 8, background: "#fff", color: "#2B8A3E", fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: "inherit", textAlign: "center" }}>
+                  ⬆ 合併匯入
+                  <input type="file" accept="application/json,.json" style={{ display: "none" }}
+                    onChange={(e) => { importData(e.target.files?.[0], "merge"); e.target.value = ""; }} />
+                </label>
+              </div>
+              <label style={{ display: "block", marginTop: 8, padding: "8px", border: "1px dashed #C62828", borderRadius: 8, background: "#fff", color: "#C62828", fontSize: 11, fontWeight: 500, cursor: "pointer", fontFamily: "inherit", textAlign: "center" }}>
+                ⚠ 完整還原（會覆蓋現有資料）
+                <input type="file" accept="application/json,.json" style={{ display: "none" }}
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    e.target.value = "";
+                    if (file && confirm("確定要用備份檔覆蓋現有資料嗎？這個動作無法復原。")) importData(file, "replace");
+                  }} />
+              </label>
+            </div>
+          )}
         </P>
       </div>
     );
@@ -763,14 +1429,45 @@ ${aiResult || "（無）"}
             <p style={{ marginTop: 10, fontWeight: 500 }}>還沒有卡關紀錄</p>
             <p style={{ fontSize: 13, color: "#999", marginTop: 4 }}>分析筆記後對不懂的地方提問，就會記錄在這</p>
           </div>
-        ) : stuckPoints.map((pt) => (
-          <div key={pt.id} style={{ background: "#fff", padding: "12px 14px", borderRadius: 8, border: "1px solid #eee", marginBottom: 8, borderLeft: `4px solid ${SUBJECTS[pt.subject]?.color || "#999"}`, opacity: pt.resolved ? 0.5 : 1 }}>
+        ) : stuckPoints.map((pt) => {
+          const subj = SUBJECTS[pt.subject];
+          const outlineGroups = parseOutline(subj?.outline);
+          const units = outlineGroups.flatMap(g => g.children);
+          const updateUnit = (newUnit) => {
+            setStuckPoints(prev => prev.map(p => p.id === pt.id ? { ...p, unit: newUnit } : p));
+          };
+          const unitOptions = outlineGroups.map((g, gi) =>
+            g.parent
+              ? <optgroup key={gi} label={g.parent}>{g.children.map(u => <option key={u} value={u}>{u}</option>)}</optgroup>
+              : g.children.map(u => <option key={u} value={u}>{u}</option>)
+          );
+          return (
+          <div key={pt.id} style={{ background: "#fff", padding: "12px 14px", borderRadius: 10, border: "1px solid #eef0f4", marginBottom: 10, borderLeft: `4px solid ${subj?.color || "#999"}`, opacity: pt.resolved ? 0.5 : 1, boxShadow: "0 2px 6px rgba(0,0,0,0.03)" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <span style={{ fontSize: 12, fontWeight: 600, color: "#777" }}>{SUBJECTS[pt.subject]?.label}</span>
+              <span style={{ fontSize: 12, fontWeight: 600, color: "#777" }}>{subj?.label}</span>
               <div style={{ display: "flex", gap: 3 }}>
-                {[1, 2, 3, 4, 5].map(d => <span key={d} style={{ width: 7, height: 7, borderRadius: "50%", background: d <= pt.difficulty ? SUBJECTS[pt.subject]?.color : "#ddd", display: "inline-block" }} />)}
+                {[1, 2, 3, 4, 5].map(d => <span key={d} style={{ width: 7, height: 7, borderRadius: "50%", background: d <= pt.difficulty ? subj?.color : "#ddd", display: "inline-block" }} />)}
               </div>
             </div>
+            {pt.unit && (
+              units.length > 0 ? (
+                <select value={pt.unit} onChange={(e) => updateUnit(e.target.value)}
+                  style={{ marginTop: 6, fontSize: 11, padding: "2px 6px", borderRadius: 4, border: `1px solid ${subj?.color}40`, background: `${subj?.color}10`, color: subj?.color, fontFamily: "inherit", cursor: "pointer", maxWidth: "100%" }}>
+                  {!units.includes(pt.unit) && <option value={pt.unit}>{pt.unit}（不在大綱）</option>}
+                  {unitOptions}
+                  <option value="">— 未分類 —</option>
+                </select>
+              ) : (
+                <span style={{ display: "inline-block", marginTop: 6, fontSize: 11, padding: "2px 8px", borderRadius: 4, background: `${subj?.color}15`, color: subj?.color }}>📍 {pt.unit}</span>
+              )
+            )}
+            {!pt.unit && units.length > 0 && (
+              <select value="" onChange={(e) => updateUnit(e.target.value)}
+                style={{ marginTop: 6, fontSize: 11, padding: "2px 6px", borderRadius: 4, border: "1px dashed #ccc", background: "#fafafa", color: "#888", fontFamily: "inherit", cursor: "pointer" }}>
+                <option value="">📍 指定單元...</option>
+                {unitOptions}
+              </select>
+            )}
             <p style={{ fontSize: 14, fontWeight: 500, marginTop: 6, lineHeight: 1.5 }}>{pt.summary}</p>
             {pt.reviewTopic && <p style={{ fontSize: 12, color: "#1971C2", marginTop: 4 }}>📚 {pt.reviewTopic}</p>}
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 8 }}>
@@ -781,10 +1478,123 @@ ${aiResult || "（無）"}
               </button>
             </div>
           </div>
-        ))}
+        );})}
       </P>
     </div>
   );
+
+  if (view === "history") {
+    // 依日期降序 + 搜尋過濾，依科目分組
+    const q = historySearch.trim().toLowerCase();
+    const filteredNotes = [...notes]
+      .filter(n => {
+        if (!q) return true;
+        const haystack = `${n.title || ""} ${n.unit || ""} ${n.content || ""} ${SUBJECTS[n.subject]?.label || ""}`.toLowerCase();
+        return haystack.includes(q);
+      })
+      .sort((a, b) => (b.id || 0) - (a.id || 0));
+    const grouped = filteredNotes.reduce((acc, n) => {
+      const key = n.subject || "_other";
+      (acc[key] = acc[key] || []).push(n);
+      return acc;
+    }, {});
+
+    return (
+      <div style={{ fontFamily: "'Noto Sans TC', sans-serif", maxWidth: 480, margin: "0 auto", minHeight: "100vh", background: "#FAFAF8" }}>
+        <style>{`@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@300;400;500;700&display=swap');*{box-sizing:border-box;margin:0;padding:0}@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}`}</style>
+        <P>
+          <Back />
+          <h2 style={{ fontSize: 20, fontWeight: 700, marginTop: 12 }}>📖 學習歷史</h2>
+          <p style={{ fontSize: 13, color: "#888", marginTop: 2, marginBottom: 12 }}>所有分析過的內容都在這</p>
+
+          {/* 搜尋框（detail view 時隱藏） */}
+          {!selectedNote && notes.length > 0 && (
+            <div style={{ position: "relative", marginBottom: 14 }}>
+              <span style={{ position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)", fontSize: 14, color: "#aaa" }}>🔍</span>
+              <input
+                value={historySearch}
+                onChange={(e) => setHistorySearch(e.target.value)}
+                placeholder="搜尋標題、單元、內文..."
+                style={{ width: "100%", padding: "10px 38px 10px 36px", border: "1px solid #e0e3e8", borderRadius: 10, fontSize: 13, fontFamily: "inherit", outline: "none", background: "#fff" }}
+              />
+              {historySearch && (
+                <button onClick={() => setHistorySearch("")}
+                  style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", fontSize: 16, color: "#999", cursor: "pointer", padding: 4, lineHeight: 1 }}>×</button>
+              )}
+            </div>
+          )}
+
+          {selectedNote ? (
+            <div>
+              <button onClick={() => setSelectedNote(null)}
+                style={{ background: "none", border: "none", fontSize: 13, color: "#888", cursor: "pointer", padding: 0, marginBottom: 10, fontFamily: "inherit" }}>
+                ← 返回歷史列表
+              </button>
+              <div style={{ background: "#fff", padding: 16, borderRadius: 12, border: "1px solid #eef0f4", boxShadow: "0 2px 8px rgba(0,0,0,0.03)" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12, paddingBottom: 10, borderBottom: "1px solid #f0f0f0" }}>
+                  <span style={{ fontSize: 20 }}>{SUBJECTS[selectedNote.subject]?.icon || "📘"}</span>
+                  <div style={{ flex: 1 }}>
+                    {selectedNote.title && <div style={{ fontWeight: 700, fontSize: 15, color: "#1a1a1a", marginBottom: 2 }}>{selectedNote.title}</div>}
+                    <div style={{ fontSize: 11, color: "#999", display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                      <span>{SUBJECTS[selectedNote.subject]?.label || "未分類"}</span>
+                      <span>·</span>
+                      <span>{selectedNote.timestamp}</span>
+                      {selectedNote.unit && (
+                        <span style={{ padding: "2px 7px", borderRadius: 4, background: `${SUBJECTS[selectedNote.subject]?.color || "#999"}15`, color: SUBJECTS[selectedNote.subject]?.color || "#999", fontWeight: 500 }}>📍 {selectedNote.unit}</span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+                {renderAIContent(selectedNote.content || "")}
+              </div>
+            </div>
+          ) : notes.length === 0 ? (
+            <div style={{ textAlign: "center", padding: "44px 20px", color: "#777" }}>
+              <span style={{ fontSize: 44 }}>📖</span>
+              <p style={{ marginTop: 10, fontWeight: 500 }}>還沒有任何紀錄</p>
+              <p style={{ fontSize: 13, color: "#999", marginTop: 4 }}>分析過的圖片會自動存到這裡</p>
+            </div>
+          ) : filteredNotes.length === 0 ? (
+            <div style={{ textAlign: "center", padding: "44px 20px", color: "#777" }}>
+              <span style={{ fontSize: 44 }}>🔍</span>
+              <p style={{ marginTop: 10, fontWeight: 500 }}>找不到符合「{historySearch}」的紀錄</p>
+              <button onClick={() => setHistorySearch("")} style={{ marginTop: 10, padding: "6px 14px", border: "1px solid #ddd", borderRadius: 6, background: "#fff", fontSize: 12, cursor: "pointer", fontFamily: "inherit" }}>清除搜尋</button>
+            </div>
+          ) : (
+            Object.entries(grouped).map(([sKey, list]) => (
+              <div key={sKey} style={{ marginBottom: 18 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                  <span style={{ width: 4, height: 16, background: SUBJECTS[sKey]?.color || "#999", borderRadius: 2 }} />
+                  <span style={{ fontSize: 13, fontWeight: 700, color: "#444" }}>
+                    {SUBJECTS[sKey]?.icon} {SUBJECTS[sKey]?.label || "未分類"}
+                  </span>
+                  <span style={{ fontSize: 11, color: "#999" }}>· {list.length} 則</span>
+                </div>
+                {list.map((n) => {
+                  const subjColor = SUBJECTS[sKey]?.color || "#999";
+                  const preview = (n.content || "").replace(/^#+\s*/gm, "").replace(/\*\*/g, "").slice(0, 60);
+                  return (
+                    <button key={n.id} onClick={() => setSelectedNote(n)}
+                      style={{ width: "100%", textAlign: "left", background: "#fff", padding: "12px 14px", borderRadius: 10, border: "1px solid #eef0f4", marginBottom: 8, cursor: "pointer", fontFamily: "inherit", display: "block", boxShadow: "0 2px 6px rgba(0,0,0,0.02)" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4, gap: 6 }}>
+                        <span style={{ fontSize: 11, color: "#999" }}>{n.timestamp}</span>
+                        {n.unit && <span style={{ fontSize: 10, padding: "2px 7px", borderRadius: 4, background: `${subjColor}15`, color: subjColor, fontWeight: 500 }}>📍 {n.unit}</span>}
+                      </div>
+                      {n.title ? (
+                        <p style={{ fontSize: 14, fontWeight: 600, color: "#1a1a1a", lineHeight: 1.4, margin: 0 }}>{n.title}</p>
+                      ) : (
+                        <p style={{ fontSize: 13, color: "#444", lineHeight: 1.5, margin: 0 }}>{preview}{preview.length >= 60 ? "..." : ""}</p>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            ))
+          )}
+        </P>
+      </div>
+    );
+  }
 
   if (view === "review") {
     const unresolved = stuckPoints
@@ -818,9 +1628,17 @@ ${aiResult || "（無）"}
             {!showAnswer ? (
               <p style={{ marginTop: 20, fontSize: 13, color: "#ccc" }}>👆 點擊看解答</p>
             ) : (
-              <div style={{ marginTop: 16, paddingTop: 14, borderTop: "1px solid #eee", textAlign: "left", width: "100%" }}>
-                <p style={{ fontSize: 14, lineHeight: 1.6, color: "#444" }}>{card.summary}</p>
-                {card.reviewTopic && <p style={{ fontSize: 13, color: "#1971C2", marginTop: 6 }}>📚 {card.reviewTopic}</p>}
+              <div onClick={(e) => e.stopPropagation()}
+                style={{ marginTop: 16, paddingTop: 14, borderTop: "1px solid #eee", textAlign: "left", width: "100%", maxHeight: "60vh", overflowY: "auto" }}>
+                {/* 若 answer 是當初 AI 完整解答 → 套用排版；否則 fallback 到 summary */}
+                {card.answer && card.answer.trim() && card.answer !== card.summary ? (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>{renderAIContent(card.answer)}</div>
+                ) : (
+                  <p style={{ fontSize: 14, lineHeight: 1.6, color: "#444" }}>
+                    <RenderWithMath text={card.summary || "（沒有更多內容）"} />
+                  </p>
+                )}
+                {card.reviewTopic && <p style={{ fontSize: 13, color: "#1971C2", marginTop: 8 }}>📚 {card.reviewTopic}</p>}
               </div>
             )}
           </div>
@@ -830,6 +1648,13 @@ ${aiResult || "（無）"}
             <button onClick={() => handleGrade(3)} style={{ flex: 1, padding: "13px 6px", border: "none", borderRadius: 8, cursor: "pointer", color: "#fff", fontSize: 13, fontWeight: 600, fontFamily: "inherit", background: "#E8590C" }}>🤔 模糊<div style={{ fontSize: 10, opacity: 0.8, marginTop: 2 }}>明天</div></button>
             <button onClick={() => handleGrade(5)} style={{ flex: 1, padding: "13px 6px", border: "none", borderRadius: 8, cursor: "pointer", color: "#fff", fontSize: 13, fontWeight: 600, fontFamily: "inherit", background: "#2B8A3E" }}>✅ 懂了<div style={{ fontSize: 10, opacity: 0.8, marginTop: 2 }}>拉長間隔</div></button>
           </div>
+
+          {/* #9 跳過（不寫入 SRS） */}
+          <button onClick={() => { setShowAnswer(false); setCurrentCard(c => c + 1); }}
+            title="只看下一張不評分，不影響複習排程"
+            style={{ width: "100%", marginTop: 8, padding: "10px", border: "1px solid #ddd", borderRadius: 8, background: "#fff", color: "#888", fontSize: 12, fontWeight: 500, cursor: "pointer", fontFamily: "inherit" }}>
+            ⏭ 看下一張（不評分）
+          </button>
         </P>
       </div>
     );
