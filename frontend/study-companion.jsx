@@ -305,6 +305,31 @@ const formatDueLabel = (card) => {
   return `${days} 天後`;
 };
 
+// ===== Toast（純 DOM，避免改動每個 view 的 JSX）=====
+const TOAST_BG = { info: "#1a1a1a", success: "#2B8A3E", warn: "#E8590C", error: "#C62828" };
+const showToast = (message, kind = "info", duration = 2200) => {
+  if (typeof window === "undefined") return;
+  let el = document.getElementById("__sc_toast");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "__sc_toast";
+    el.style.cssText = "position:fixed;left:50%;bottom:96px;transform:translate(-50%,16px);z-index:9999;pointer-events:none;opacity:0;transition:opacity .2s, transform .2s;font-family:'Noto Sans TC',sans-serif;font-size:13px;font-weight:600;padding:10px 16px;border-radius:999px;color:#fff;box-shadow:0 6px 20px rgba(0,0,0,.25);max-width:90vw;white-space:pre-wrap;text-align:center;line-height:1.5";
+    document.body.appendChild(el);
+  }
+  el.textContent = message;
+  el.style.background = TOAST_BG[kind] || TOAST_BG.info;
+  // 強制 reflow → 觸發 transition
+  // eslint-disable-next-line no-unused-expressions
+  el.offsetHeight;
+  el.style.opacity = "1";
+  el.style.transform = "translate(-50%,0)";
+  clearTimeout(el.__timer);
+  el.__timer = setTimeout(() => {
+    el.style.opacity = "0";
+    el.style.transform = "translate(-50%,16px)";
+  }, duration);
+};
+
 const DEMO_RESULTS = {
   math: `## 內容辨識：二次方程式求解\n二次方程式 ax² + bx + c = 0\n公式解：x = (-b ± √(b²-4ac)) / 2a [高信心]\n\n## 筆記中的範例\n求解 2x² + 5x - 3 = 0\na=2, b=5, c=-3\n判別式 D = 25 - 4(2)(-3) = 25 + 24 = 49 [高信心]\n\n❌ 錯誤發現\n筆記中寫 x = (-5 ± 7) / 2，但分母應該是 2a = 4，不是 2 [高信心]\n正確答案：x = (-5+7)/4 = 1/2 或 x = (-5-7)/4 = -3 [需驗證]\n\n💡 補充\n判別式 D > 0 代表有兩個相異實根；D = 0 為重根；D < 0 無實數解 [高信心]\n當 a=1 時可優先嘗試因式分解，比公式解更快 [高信心]`,
   electronics: `## 內容辨識：BJT 共射極放大器\n電路為 NPN BJT 共射極（Common Emitter）組態 [高信心]\n偏壓方式：電壓分壓偏壓（Voltage Divider Bias） [高信心]\n\n## 直流分析\nVB = VCC × R2/(R1+R2) [高信心]\nVE = VB - VBE ≈ VB - 0.7V [高信心]\nIC ≈ IE = VE/RE [高信心]\n\n⚠ 注意\n筆記中 VBE 取 0.7V 是矽電晶體的近似值，鍺電晶體應取 0.3V [高信心]\n\n💡 補充\n電壓增益 Av = -gm × (RC ∥ RL)，負號代表反相 [高信心]\n輸入阻抗 Zin ≈ R1 ∥ R2 ∥ (β × re)，其中 re = VT/IC [需驗證]`,
@@ -338,6 +363,7 @@ export default function StudyCompanion() {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [historySearch, setHistorySearch] = useState("");
   const [savedToStuck, setSavedToStuck] = useState(false);
+  const [savedStuckId, setSavedStuckId] = useState(null);
   // #5 \u7be9\u9078
   const [historyFilter, setHistoryFilter] = useState("all"); // all | week | lowconf
   const [stuckFilter, setStuckFilter] = useState("unresolved"); // unresolved | due | resolved | all
@@ -471,7 +497,7 @@ export default function StudyCompanion() {
         outline: prev.outline ? `${prev.outline.trim()}\n${cleaned}` : cleaned,
       }));
     } catch (err) {
-      alert("辨識失敗：" + err.message);
+      showToast("辨識失敗：" + err.message, "error", 3500);
     } finally {
       setOutlineExtracting(false);
       setOutlineProgress({ current: 0, total: 0 });
@@ -504,6 +530,7 @@ export default function StudyCompanion() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+    showToast("備份已下載", "success");
   };
 
   const importData = (file, mode = "merge") => {
@@ -521,7 +548,7 @@ export default function StudyCompanion() {
           setStuckPoints(importedStuck);
           setNotes(importedNotes);
           setSubjects(Object.keys(importedSubjects).length > 0 ? importedSubjects : DEFAULT_SUBJECTS);
-          alert(`✓ 已還原備份\n卡關 ${importedStuck.length}・歷史 ${importedNotes.length}・科目 ${Object.keys(importedSubjects).length}`);
+          showToast(`已還原備份 · 卡關 ${importedStuck.length}・歷史 ${importedNotes.length}`, "success", 3000);
         } else {
           // merge: 以 id 去重
           setStuckPoints(prev => {
@@ -543,10 +570,10 @@ export default function StudyCompanion() {
             }
             return next;
           });
-          alert(`✓ 已合併備份\n新增卡關 ${importedStuck.length}・新增歷史 ${importedNotes.length}`);
+          showToast(`已合併備份 · 新增卡關 ${importedStuck.length}・歷史 ${importedNotes.length}`, "success", 3000);
         }
       } catch (err) {
-        alert("匯入失敗：" + err.message);
+        showToast("匯入失敗：" + err.message, "error", 3500);
       }
     };
     reader.readAsText(file);
@@ -1290,19 +1317,29 @@ ${aiResult || "（無）"}
       || "未命名";
     const stickyUnit = latestNote?.unit || "";
     const handleSaveStuck = () => {
-      if (savedToStuck || !aiResult) return;
-      addStuckPoint({
-        summary: stickyTitle,
-        difficulty: 3,
-        reviewTopic: "",
-        unit: stickyUnit,
-        question: stickyTitle,
-        answer: aiResult,
-      });
+      if (!aiResult) return;
+      if (savedToStuck) {
+        // 再點一次 → 取消收藏（移除剛建立的那筆）
+        if (savedStuckId) {
+          setStuckPoints(prev => prev.filter(p => p.id !== savedStuckId));
+        }
+        setSavedToStuck(false);
+        setSavedStuckId(null);
+        showToast("已取消收藏", "info");
+        return;
+      }
+      const id = Date.now();
+      setStuckPoints(prev => [{
+        id, summary: stickyTitle, difficulty: 3, reviewTopic: "", unit: stickyUnit,
+        question: stickyTitle, answer: aiResult, subject,
+        timestamp: new Date().toLocaleDateString("zh-TW"), resolved: false, ...initSRS(),
+      }, ...prev]);
       setSavedToStuck(true);
+      setSavedStuckId(id);
+      showToast("已加入複習卡組 · 1 天後出現", "success");
     };
     const handleNextImage = () => {
-      setView("upload"); setImage(null); setImageData(null); setAiResult(null); setFollowUp(null); setSavedToStuck(false);
+      setView("upload"); setImage(null); setImageData(null); setAiResult(null); setFollowUp(null); setSavedToStuck(false); setSavedStuckId(null);
     };
     return (
     <div style={{ fontFamily: "'Noto Sans TC', sans-serif", maxWidth: 480, margin: "0 auto", minHeight: "100vh", background: "#FAFAF8" }}>
@@ -1316,9 +1353,9 @@ ${aiResult || "（無）"}
           <span style={{ fontSize: 13, fontWeight: 600, color: "#1a1a1a", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
             {SUBJECTS[subject]?.icon} {stickyTitle}
           </span>
-          <button onClick={handleSaveStuck} disabled={savedToStuck}
-            title={savedToStuck ? "已加入卡關" : "加入卡關·之後複習"}
-            style={{ padding: "6px 10px", border: `1px solid ${savedToStuck ? "#2B8A3E" : "#E8590C"}`, borderRadius: 8, background: savedToStuck ? "#E6F9E8" : "#FFF4E6", color: savedToStuck ? "#1B5E20" : "#BF360C", fontSize: 12, fontWeight: 600, cursor: savedToStuck ? "default" : "pointer", fontFamily: "inherit", whiteSpace: "nowrap" }}>
+          <button onClick={handleSaveStuck}
+            title={savedToStuck ? "再點一次取消收藏" : "加入卡關 · 之後複習"}
+            style={{ padding: "6px 10px", border: `1px solid ${savedToStuck ? "#2B8A3E" : "#E8590C"}`, borderRadius: 8, background: savedToStuck ? "#E6F9E8" : "#FFF4E6", color: savedToStuck ? "#1B5E20" : "#BF360C", fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "inherit", whiteSpace: "nowrap" }}>
             {savedToStuck ? "✓ 已收藏" : "🚧 收藏"}
           </button>
           <button onClick={handleNextImage}
@@ -1544,6 +1581,7 @@ ${aiResult || "（無）"}
     const deleteStuck = (id) => {
       if (!window.confirm("\u78ba\u5b9a\u8981\u522a\u9664\u9019\u500b\u5361\u95dc\u9ede\u55ce\uff1f\u9023\u540c\u8907\u7fd2\u6392\u7a0b\u4e00\u8d77\u522a\u9664\uff0c\u7121\u6cd5\u5fa9\u539f\u3002")) return;
       setStuckPoints(prev => prev.filter(p => p.id !== id));
+      showToast("\u5df2\u522a\u9664\u5361\u95dc\u9ede", "info");
     };
     return (
     <div style={{ fontFamily: "'Noto Sans TC', sans-serif", maxWidth: 480, margin: "0 auto", minHeight: "100vh", background: "#FAFAF8" }}>
@@ -1674,6 +1712,7 @@ ${aiResult || "（無）"}
       if (!window.confirm("\u78ba\u5b9a\u8981\u522a\u9664\u9019\u7b46\u7b46\u8a18\u55ce\uff1f\u9019\u500b\u52d5\u4f5c\u7121\u6cd5\u5fa9\u539f\u3002")) return;
       setNotes(prev => prev.filter(n => n.id !== id));
       if (selectedNote?.id === id) setSelectedNote(null);
+      showToast("\u5df2\u522a\u9664\u7d00\u9304", "info");
     };
 
     return (
@@ -1963,7 +2002,7 @@ ${aiResult || "（無）"}
               <p style={{ marginTop: 20, fontSize: 13, color: "#ccc" }}>\ud83d\udc46 \u9ede\u64ca\u770b\u89e3\u7b54 <span style={{ fontSize: 10, opacity: 0.7, marginLeft: 4 }}>(Space)</span></p>
             ) : (
               <div onClick={(e) => e.stopPropagation()}
-                style={{ marginTop: 16, paddingTop: 14, borderTop: "1px solid #eee", textAlign: "left", width: "100%", maxHeight: "60vh", overflowY: "auto" }}>
+                style={{ marginTop: 16, paddingTop: 14, borderTop: "1px solid #eee", textAlign: "left", width: "100%", overflowY: "visible" }}>
                 {/* 若 answer 是當初 AI 完整解答 → 套用排版；否則 fallback 到 summary */}
                 {card.answer && card.answer.trim() && card.answer !== card.summary ? (
                   <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>{renderAIContent(card.answer)}</div>
@@ -1977,24 +2016,27 @@ ${aiResult || "（無）"}
             )}
           </div>
 
-          <div style={{ display: "flex", gap: 8, marginTop: 18 }}>
-            <button onClick={() => handleGrade(0)} title="\u5feb\u6377\u9375 1" style={{ flex: 1, padding: "13px 6px", border: "none", borderRadius: 8, cursor: "pointer", color: "#fff", fontSize: 13, fontWeight: 600, fontFamily: "inherit", background: "#C62828" }}>\ud83d\ude35 \u4e0d\u61c2<div style={{ fontSize: 10, opacity: 0.8, marginTop: 2 }}>10 \u5206\u9418\u5f8c \u00b7 1</div></button>
-            <button onClick={() => handleGrade(3)} title="\u5feb\u6377\u9375 2" style={{ flex: 1, padding: "13px 6px", border: "none", borderRadius: 8, cursor: "pointer", color: "#fff", fontSize: 13, fontWeight: 600, fontFamily: "inherit", background: "#E8590C" }}>\ud83e\udd14 \u6a21\u7cca<div style={{ fontSize: 10, opacity: 0.8, marginTop: 2 }}>\u660e\u5929 \u00b7 2</div></button>
-            <button onClick={() => handleGrade(5)} title="\u5feb\u6377\u9375 3" style={{ flex: 1, padding: "13px 6px", border: "none", borderRadius: 8, cursor: "pointer", color: "#fff", fontSize: 13, fontWeight: 600, fontFamily: "inherit", background: "#2B8A3E" }}>\u2705 \u61c2\u4e86<div style={{ fontSize: 10, opacity: 0.8, marginTop: 2 }}>\u62c9\u9577\u9593\u9694 \u00b7 3</div></button>
-          </div>
-
-          {/* #9 \u8df3\u904e\uff08\u4e0d\u5beb\u5165 SRS\uff09 */}
-          <button onClick={handleSkip}
-            title="\u5feb\u6377\u9375 S\uff1a\u770b\u4e0b\u4e00\u5f35\u4e0d\u8a55\u5206\uff0c\u4e0d\u5f71\u97ff\u8907\u7fd2\u6392\u7a0b"
-            style={{ width: "100%", marginTop: 8, padding: "10px", border: "1px solid #ddd", borderRadius: 8, background: "#fff", color: "#888", fontSize: 12, fontWeight: 500, cursor: "pointer", fontFamily: "inherit" }}>
-            \u23ed \u770b\u4e0b\u4e00\u5f35\uff08\u4e0d\u8a55\u5206 \u00b7 S\uff09
-          </button>
-
-          {/* \u684c\u9762\u63d0\u793a */}
-          <p style={{ fontSize: 10, color: "#bbb", textAlign: "center", marginTop: 14 }}>
-            \ud83d\udcbb \u684c\u9762\u5feb\u6377\u9375\uff1aSpace \u7ffb\u9762 \u00b7 1/2/3 \u8a55\u5206 \u00b7 S \u8df3\u904e
-          </p>
+          {/* \u8a55\u5206\u5340\uff1asticky bottom\uff0c\u907f\u514d\u9577\u7b54\u6848\u628a\u6309\u9215\u63a8\u51fa\u756b\u9762 */}
+          <div style={{ height: 168 }} /> {/* placeholder \u9632\u88ab sticky \u906e\u4f4f */}
         </P>
+
+        <div style={{ position: "fixed", left: 0, right: 0, bottom: 0, zIndex: 30, background: "rgba(250,250,248,0.96)", backdropFilter: "blur(10px)", borderTop: "1px solid #eef0f4", paddingBottom: "max(10px, env(safe-area-inset-bottom))" }}>
+          <div style={{ maxWidth: 480, margin: "0 auto", padding: "12px 18px 0" }}>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={() => handleGrade(0)} title="\u5feb\u6377\u9375 1" style={{ flex: 1, padding: "13px 6px", border: "none", borderRadius: 8, cursor: "pointer", color: "#fff", fontSize: 13, fontWeight: 600, fontFamily: "inherit", background: "#C62828" }}>\ud83d\ude35 \u4e0d\u61c2<div style={{ fontSize: 10, opacity: 0.8, marginTop: 2 }}>10 \u5206\u9418\u5f8c \u00b7 1</div></button>
+              <button onClick={() => handleGrade(3)} title="\u5feb\u6377\u9375 2" style={{ flex: 1, padding: "13px 6px", border: "none", borderRadius: 8, cursor: "pointer", color: "#fff", fontSize: 13, fontWeight: 600, fontFamily: "inherit", background: "#E8590C" }}>\ud83e\udd14 \u6a21\u7cca<div style={{ fontSize: 10, opacity: 0.8, marginTop: 2 }}>\u660e\u5929 \u00b7 2</div></button>
+              <button onClick={() => handleGrade(5)} title="\u5feb\u6377\u9375 3" style={{ flex: 1, padding: "13px 6px", border: "none", borderRadius: 8, cursor: "pointer", color: "#fff", fontSize: 13, fontWeight: 600, fontFamily: "inherit", background: "#2B8A3E" }}>\u2705 \u61c2\u4e86<div style={{ fontSize: 10, opacity: 0.8, marginTop: 2 }}>\u62c9\u9577\u9593\u9694 \u00b7 3</div></button>
+            </div>
+            <button onClick={handleSkip}
+              title="\u5feb\u6377\u9375 S\uff1a\u770b\u4e0b\u4e00\u5f35\u4e0d\u8a55\u5206"
+              style={{ width: "100%", marginTop: 8, padding: "8px", border: "1px solid #e6e6e6", borderRadius: 8, background: "#fff", color: "#999", fontSize: 12, fontWeight: 500, cursor: "pointer", fontFamily: "inherit" }}>
+              \u23ed \u770b\u4e0b\u4e00\u5f35\uff08\u4e0d\u8a55\u5206 \u00b7 S\uff09
+            </button>
+            <p style={{ fontSize: 10, color: "#bbb", textAlign: "center", marginTop: 6 }}>
+              Space \u7ffb\u9762 \u00b7 1/2/3 \u8a55\u5206 \u00b7 S \u8df3\u904e
+            </p>
+          </div>
+        </div>
       </div>
     );
   }
