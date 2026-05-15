@@ -33,18 +33,58 @@ async function callAI(payload, provider) {
   const headers = { "Content-Type": "application/json" };
   if (APP_TOKEN) headers["X-App-Token"] = APP_TOKEN;
   const model = payload.model || AI_PROVIDERS[useProvider].model;
-  const response = await fetch(PROXY_URL, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ ...payload, model, provider: useProvider }),
-  });
-  if (!response.ok) {
-    let detail = "";
-    try { detail = (await response.json()).error || ""; } catch {}
-    throw new Error(`Proxy ${response.status}: ${detail || response.statusText}`);
+  const body = JSON.stringify({ ...payload, model, provider: useProvider });
+
+  // 最多重試 1 次（3xx/4xx 不重試、只對網路/5xx 重試）
+  let lastErr;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const response = await fetch(PROXY_URL, { method: "POST", headers, body });
+      if (!response.ok) {
+        let detail = "";
+        try { detail = (await response.json()).error || ""; } catch {}
+        const err = new Error(`Proxy ${response.status}: ${detail || response.statusText}`);
+        err.status = response.status;
+        // 4xx 是請求本身的問題，重試也沒用
+        if (response.status >= 400 && response.status < 500) throw err;
+        throw err;
+      }
+      return response.json();
+    } catch (err) {
+      lastErr = err;
+      if (err.status && err.status >= 400 && err.status < 500) throw err;
+      if (attempt === 0) await new Promise(r => setTimeout(r, 800));
+    }
   }
-  return response.json();
+  throw lastErr;
 }
+
+// 圖片壓縮：超過 maxDim 就縮小，輸出 JPEG。大多數床級圖片能縮到 < 500KB。
+const compressImage = (dataUrl, maxDim = 1600, quality = 0.85) => new Promise((resolve) => {
+  try {
+    const img = new Image();
+    img.onload = () => {
+      let { width, height } = img;
+      if (width > maxDim || height > maxDim) {
+        const ratio = Math.min(maxDim / width, maxDim / height);
+        width = Math.round(width * ratio);
+        height = Math.round(height * ratio);
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = "#fff"; // 防透明背景變黑
+      ctx.fillRect(0, 0, width, height);
+      ctx.drawImage(img, 0, 0, width, height);
+      resolve(canvas.toDataURL("image/jpeg", quality));
+    };
+    img.onerror = () => resolve(dataUrl);
+    img.src = dataUrl;
+  } catch {
+    resolve(dataUrl);
+  }
+});
 
 const DEFAULT_SUBJECTS = {
   math: { label: "數學", icon: "∑", color: "#E8590C", outline: "" },
@@ -324,14 +364,17 @@ export default function StudyCompanion() {
   // 大綱辨識進度（#16）
   const [outlineProgress, setOutlineProgress] = useState({ current: 0, total: 0 });
 
-  // 自動持久化
+  // 自動持久化（debounce 400ms，避免每次 keystroke 都同步寫入 localStorage）
   useEffect(() => {
-    const result = saveState(stuckPoints, notes, subjects);
-    if (!result.ok) {
-      setStorageWarn(result.quota ? "quota" : "error");
-    } else if (storageWarn) {
-      setStorageWarn(null);
-    }
+    const t = setTimeout(() => {
+      const result = saveState(stuckPoints, notes, subjects);
+      if (!result.ok) {
+        setStorageWarn(result.quota ? "quota" : "error");
+      } else {
+        setStorageWarn(w => (w ? null : w));
+      }
+    }, 400);
+    return () => clearTimeout(t);
   }, [stuckPoints, notes, subjects]);
 
   // 別名：保留原本 SUBJECTS 名稱以最小化變動
@@ -516,9 +559,17 @@ export default function StudyCompanion() {
   const processFile = useCallback((file) => {
     if (!file || !file.type.startsWith("image/")) return;
     const reader = new FileReader();
-    reader.onload = (ev) => {
-      setImage(ev.target.result);
-      setImageData(ev.target.result.split(",")[1]);
+    reader.onload = async (ev) => {
+      const raw = ev.target.result;
+      // 允許先快速預覽，背景壓縮完再換上
+      setImage(raw);
+      try {
+        const compressed = await compressImage(raw);
+        setImage(compressed);
+        setImageData(compressed.split(",")[1]);
+      } catch {
+        setImageData(raw.split(",")[1]);
+      }
     };
     reader.readAsDataURL(file);
   }, []);
@@ -540,6 +591,20 @@ export default function StudyCompanion() {
     window.addEventListener("paste", handler);
     return () => window.removeEventListener("paste", handler);
   }, [view, processFile]);
+
+  // 全域 ESC 關閉彈出層：拍照選科目 sheet、編輯科目表單
+  useEffect(() => {
+    if (!pickerOpen && editingSubject === null) return;
+    const onKey = (e) => {
+      if (e.key !== "Escape") return;
+      const tag = e.target?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || e.target?.isContentEditable) return;
+      if (pickerOpen) setPickerOpen(false);
+      else if (editingSubject !== null) setEditingSubject(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [pickerOpen, editingSubject]);
 
   // #1 \u8907\u7fd2\u9801\u9375\u76e4\u5feb\u6377\u9375 + #3 \u9032\u5165 review \u6642\u521d\u59cb\u5316 session
   useEffect(() => {
@@ -645,8 +710,11 @@ export default function StudyCompanion() {
       setAiResult(cleanText);
       addNote({ content: cleanText, type: "analysis", title, unit });
       setView("result");
+      // 分析完成：釋放圖片記憶體（避免 base64 長期滞留在 state）
+      setImage(null);
+      setImageData(null);
     } catch (err) {
-      setAiResult("分析時發生錯誤：" + err.message);
+      setAiResult("分析時發生錯誤：" + err.message + "\n\n\u8acb檢查網路連線、或在首頁切換另一個 AI 引擎後重試。");
       setView("result");
     } finally {
       setLoading(false);
